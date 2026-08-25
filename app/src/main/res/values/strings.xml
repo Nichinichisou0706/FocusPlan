@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">自律计划</string>
+    <string name="focus_accessibility_description">在严格专注期间识别并拦截不在白名单中的应用</string>
+</resources>
