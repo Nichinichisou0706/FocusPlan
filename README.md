@@ -13,6 +13,26 @@
 - 智能助手：支持 OpenAI-compatible 多模型配置、自动切换、正常对话、分天任务草案及一键创建和排程。
 - 状态化 UI：浅色/深色主题、角色状态反馈、自适应桌面图标和手机/横屏导航。
 
+## 应用截图
+
+| 任务 | 时间轴 | 专注 |
+| --- | --- | --- |
+| <img src="docs/screenshots/tasks.png" alt="任务列表" width="240"> | <img src="docs/screenshots/timeline.png" alt="日时间轴" width="240"> | <img src="docs/screenshots/focus.png" alt="任务番茄表" width="240"> |
+
+| 智能助手 |
+| --- |
+| <img src="docs/screenshots/assistant.png" alt="智能助手" width="360"> |
+
+## 已验证环境
+
+目前只在以下一台真机上完成安装和功能验证：
+
+- 设备：Xiaomi Civi 3（型号 `23046PNC9C`）
+- 系统：Android 15 / API 35
+- ROM：Xiaomi HyperOS OS3.0，版本 `OS3.0.10.0.VMICNXM`
+
+其他 Xiaomi/HyperOS 版本、MIUI、原生 Android 以及其他品牌 ROM 均未验证。不同系统的权限入口和后台限制可能不同，通知、自启动、后台运行、无障碍服务、使用情况访问和电池优化等能力可能需要自行修改或适配。本项目不声明兼容所有 Android 设备。
+
 ## 开发与打包平台
 
 推荐在 Windows 10/11 使用 Android Studio（Ladybug 或更新稳定版）开发和打包。项目是标准 Kotlin/Jetpack Compose Android 工程，也可在 macOS 或 Linux 构建。
