@@ -9,6 +9,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
@@ -19,7 +20,21 @@ data class AssistantReply(
     val localFallback: Boolean = false
 )
 
-private data class ModelAttempt(val text: String? = null, val error: String? = null, val retryPlain: Boolean = false)
+data class ModelRequestOptions(
+    val maxTokens: Int? = null,
+    val totalTimeoutMillis: Long? = null,
+    val maxCandidates: Int = Int.MAX_VALUE,
+    val retryWithoutJson: Boolean = true,
+    val preferFastModel: Boolean = false,
+    val disableThinking: Boolean = false
+)
+
+private data class ModelAttempt(
+    val text: String? = null,
+    val error: String? = null,
+    val retryPlain: Boolean = false,
+    val retryWithoutThinking: Boolean = false
+)
 
 class ModelRouter(private val apiKeys: ApiKeyStore) {
     private val client = OkHttpClient.Builder()
@@ -29,47 +44,124 @@ class ModelRouter(private val apiKeys: ApiKeyStore) {
         .callTimeout(150, TimeUnit.SECONDS)
         .build()
 
-    suspend fun complete(prompt: String, profiles: List<ModelProfileEntity>, jsonMode: Boolean = false): AssistantReply = withContext(Dispatchers.IO) {
-        val candidates = profiles.filter { it.enabled }.sortedBy { it.id }
+    suspend fun complete(
+        prompt: String,
+        profiles: List<ModelProfileEntity>,
+        jsonMode: Boolean = false,
+        systemPrompt: String? = null,
+        options: ModelRequestOptions = ModelRequestOptions()
+    ): AssistantReply = withContext(Dispatchers.IO) {
+        val candidates = profiles.filter { it.enabled }.sortedBy { it.id }.take(options.maxCandidates.coerceAtLeast(1))
         if (candidates.isEmpty()) return@withContext AssistantReply("尚未启用可用模型，已改用本地规则。", "本地规则", localFallback = true)
+        val startedAt = System.nanoTime()
         var lastError: String? = null
         for ((index, profile) in candidates.withIndex()) {
+            val requestModelId = effectiveModelId(profile, options.preferFastModel)
+            val remainingMillis = options.totalTimeoutMillis?.let { limit ->
+                limit - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+            }
+            if (remainingMillis != null && remainingMillis <= 0) {
+                lastError = "智能排程已达到${options.totalTimeoutMillis / 1_000}秒等待上限"
+                break
+            }
             try {
-                val first = request(profile, prompt, planning = jsonMode, useJsonFormat = jsonMode)
-                if (!first.text.isNullOrBlank()) return@withContext AssistantReply(first.text, profile.modelId, index > 0)
-                lastError = first.error
-                if (jsonMode && first.retryPlain) {
-                    val plain = request(profile, prompt, planning = true, useJsonFormat = false)
-                    if (!plain.text.isNullOrBlank()) return@withContext AssistantReply(plain.text, profile.modelId, index > 0)
+                var thinkingControlEnabled = options.disableThinking
+                var attempt = request(
+                    profile = profile,
+                    modelId = requestModelId,
+                    prompt = prompt,
+                    planning = jsonMode,
+                    useJsonFormat = jsonMode,
+                    systemPrompt = systemPrompt,
+                    maxTokens = options.maxTokens,
+                    callTimeoutMillis = remainingMillis,
+                    disableThinking = thinkingControlEnabled
+                )
+                if (!attempt.text.isNullOrBlank()) return@withContext AssistantReply(attempt.text, requestModelId, index > 0 || requestModelId != profile.modelId)
+                lastError = attempt.error
+                var retryRemainingMillis = options.totalTimeoutMillis?.let { limit ->
+                    limit - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                }
+                if (attempt.retryWithoutThinking && (retryRemainingMillis == null || retryRemainingMillis > 0)) {
+                    thinkingControlEnabled = false
+                    attempt = request(
+                        profile = profile,
+                        modelId = requestModelId,
+                        prompt = prompt,
+                        planning = jsonMode,
+                        useJsonFormat = jsonMode,
+                        systemPrompt = systemPrompt,
+                        maxTokens = options.maxTokens,
+                        callTimeoutMillis = retryRemainingMillis,
+                        disableThinking = false
+                    )
+                    if (!attempt.text.isNullOrBlank()) return@withContext AssistantReply(attempt.text, requestModelId, index > 0 || requestModelId != profile.modelId)
+                    lastError = attempt.error
+                    retryRemainingMillis = options.totalTimeoutMillis?.let { limit ->
+                        limit - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                    }
+                }
+                if (jsonMode && attempt.retryPlain && options.retryWithoutJson && (retryRemainingMillis == null || retryRemainingMillis > 0)) {
+                    val plain = request(
+                        profile = profile,
+                        modelId = requestModelId,
+                        prompt = prompt,
+                        planning = true,
+                        useJsonFormat = false,
+                        systemPrompt = systemPrompt,
+                        maxTokens = options.maxTokens,
+                        callTimeoutMillis = retryRemainingMillis,
+                        disableThinking = thinkingControlEnabled
+                    )
+                    if (!plain.text.isNullOrBlank()) return@withContext AssistantReply(plain.text, requestModelId, index > 0 || requestModelId != profile.modelId)
                     lastError = plain.error
                 }
             } catch (e: Exception) {
-                val detail = if (e is SocketTimeoutException) "生成超时（已等待最长150秒）" else e.message ?: e.javaClass.simpleName
+                val timeoutSeconds = options.totalTimeoutMillis?.div(1_000) ?: 150
+                val detail = if (e is SocketTimeoutException || e is InterruptedIOException) "生成超时（等待上限${timeoutSeconds}秒）" else e.message ?: e.javaClass.simpleName
                 lastError = "${profile.name}: $detail"
             }
         }
-        AssistantReply("暂时无法连接模型（${lastError ?: "未知错误"}）。我已保留你的输入，可改用本地排程。", "本地规则", localFallback = true)
+        AssistantReply("模型未能及时返回可用结果（${lastError ?: "未知错误"}），已自动改用本地排程。", "本地规则", localFallback = true)
     }
 
-    private fun request(profile: ModelProfileEntity, prompt: String, planning: Boolean, useJsonFormat: Boolean): ModelAttempt {
+    private fun request(
+        profile: ModelProfileEntity,
+        modelId: String,
+        prompt: String,
+        planning: Boolean,
+        useJsonFormat: Boolean,
+        systemPrompt: String?,
+        maxTokens: Int?,
+        callTimeoutMillis: Long?,
+        disableThinking: Boolean
+    ): ModelAttempt {
+        val messages = JSONArray().apply {
+            systemPrompt?.takeIf { it.isNotBlank() }?.let { put(JSONObject().put("role", "system").put("content", it)) }
+            put(JSONObject().put("role", "user").put("content", prompt))
+        }
         val body = JSONObject()
-            .put("model", profile.modelId)
+            .put("model", modelId)
             .put("stream", false)
-            .put("max_tokens", if (planning) 8192 else 1600)
-            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+            .put("max_tokens", maxTokens ?: if (planning) 4096 else 1600)
+            .put("messages", messages)
+        if (disableThinking) body.put("thinking", JSONObject().put("type", "disabled"))
         if (useJsonFormat) body.put("response_format", JSONObject().put("type", "json_object"))
         val endpoint = profile.baseUrl.trimEnd('/').let { if (it.endsWith("/chat/completions")) it else "$it/chat/completions" }
         val request = Request.Builder().url(endpoint)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .apply { apiKeys.read(profile.apiKeyAlias)?.takeIf { it.isNotBlank() }?.let { header("Authorization", "Bearer $it") } }
             .build()
-        client.newCall(request).execute().use { response ->
+        val call = client.newCall(request)
+        callTimeoutMillis?.takeIf { it > 0 }?.let { call.timeout().timeout(it, TimeUnit.MILLISECONDS) }
+        call.execute().use { response ->
             val responseText = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val apiMessage = runCatching { JSONObject(responseText).optJSONObject("error")?.optString("message") }.getOrNull()
                 return ModelAttempt(
                     error = "${profile.name}: HTTP ${response.code}${apiMessage?.takeIf { it.isNotBlank() }?.let { "，${it.take(160)}" }.orEmpty()}",
-                    retryPlain = useJsonFormat && response.code in listOf(400, 404, 415, 422)
+                    retryPlain = useJsonFormat && response.code in listOf(400, 404, 415, 422),
+                    retryWithoutThinking = disableThinking && response.code in listOf(400, 404, 415, 422)
                 )
             }
             val json = JSONObject(responseText)
@@ -81,9 +173,17 @@ class ModelRouter(private val apiKeys: ApiKeyStore) {
             val tokenText = completionTokens?.let { "，输出${it} tokens" }.orEmpty()
             return ModelAttempt(
                 error = "${profile.name}: 模型返回为空（finish_reason=$finishReason$tokenText）",
-                retryPlain = useJsonFormat
+                retryPlain = useJsonFormat && finishReason.lowercase() !in setOf("length", "max_tokens")
             )
         }
+    }
+
+    private fun effectiveModelId(profile: ModelProfileEntity, preferFastModel: Boolean): String {
+        if (!preferFastModel) return profile.modelId
+        val officialDeepSeek = runCatching {
+            java.net.URI(profile.baseUrl).host?.equals("api.deepseek.com", ignoreCase = true) == true
+        }.getOrDefault(false)
+        return if (officialDeepSeek && profile.modelId.equals("deepseek-reasoner", ignoreCase = true)) "deepseek-chat" else profile.modelId
     }
 
     private fun extractResponseText(root: JSONObject, allowReasoningJson: Boolean): String? {

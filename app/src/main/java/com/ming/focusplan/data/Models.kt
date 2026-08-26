@@ -15,11 +15,19 @@ enum class Priority(val rank: Int, val label: String) {
 data class TaskEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val title: String,
+    val detail: String = "",
     val subject: String = "未分类",
     val priority: Int = Priority.MEDIUM.rank,
     val estimatedMinutes: Int = 50,
+    val plannedDayEpoch: Long? = null,
     val dueAt: Long? = null,
     val completed: Boolean = false,
+    val parentTaskId: Long? = null,
+    val splitGroupId: String? = null,
+    val splitIndex: Int? = null,
+    val splitCount: Int? = null,
+    val hidden: Boolean = false,
+    val originalMinutes: Int? = null,
     val createdAt: Long = System.currentTimeMillis()
 )
 

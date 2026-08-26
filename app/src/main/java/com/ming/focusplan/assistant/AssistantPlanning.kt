@@ -1,6 +1,7 @@
 package com.ming.focusplan.assistant
 
 import com.ming.focusplan.data.Priority
+import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
 import java.util.UUID
@@ -25,6 +26,21 @@ data class AssistantPreset(
     val excludedTimes: List<ExcludedTime> = emptyList()
 )
 
+data class AssistantPresetRevision(
+    val effectiveDayEpoch: Long,
+    val preset: AssistantPreset
+)
+
+fun presetEffectiveOn(
+    history: List<AssistantPresetRevision>,
+    dayEpoch: Long,
+    fallback: AssistantPreset
+): AssistantPreset = history
+    .filter { it.effectiveDayEpoch <= dayEpoch }
+    .maxByOrNull { it.effectiveDayEpoch }
+    ?.preset
+    ?: fallback
+
 data class AssistantTaskSuggestion(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
@@ -32,7 +48,7 @@ data class AssistantTaskSuggestion(
     val label: String = "未分类",
     val priority: Priority = Priority.MEDIUM,
     val minutes: Int = 50,
-    val dayOffset: Int = 0,
+    val dayOffset: Int? = null,
     val selected: Boolean = true
 )
 
@@ -75,27 +91,32 @@ object AssistantPlanParser {
         val end = clean.lastIndexOf('}')
         require(start >= 0 && end > start) { "模型未返回任务 JSON" }
         val root = JSONObject(clean.substring(start, end + 1))
-        val isPlanning = root.optString("type", "plan").lowercase() != "chat"
-        val array = root.optJSONArray("tasks")
+        val array = findTaskArray(root)
         val tasks = buildList {
             if (array != null) {
                 for (index in 0 until array.length()) {
-                    val item = array.optJSONObject(index) ?: continue
-                    val title = item.optString("title").trim()
+                    val value = array.opt(index)
+                    if (value is String && value.isNotBlank()) {
+                        add(AssistantTaskSuggestion(title = value.trim().take(80)))
+                        continue
+                    }
+                    val item = value as? JSONObject ?: continue
+                    val title = item.firstString("title", "name", "taskName", "task").take(80)
                     if (title.isBlank()) continue
                     add(
                         AssistantTaskSuggestion(
                             title = title,
-                            detail = item.optString("detail").trim(),
-                            label = item.optString("label").trim().ifBlank { "未分类" },
-                            priority = parsePriority(item.optString("priority")),
-                            minutes = item.optInt("minutes", 50).coerceIn(10, 480),
-                            dayOffset = item.optInt("dayOffset", 0).coerceIn(0, 30)
+                            detail = item.firstString("detail", "description", "desc", "steps"),
+                            label = item.firstString("label", "subject", "category", "tag").ifBlank { "未分类" },
+                            priority = parsePriority(item.firstString("priority", "level")),
+                            minutes = item.taskMinutes(),
+                            dayOffset = item.optionalDayOffset("dayOffset", "day", "dayIndex")
                         )
                     )
                 }
             }
         }
+        val isPlanning = tasks.isNotEmpty() || root.optString("type", "plan").lowercase() != "chat"
         if (isPlanning) require(tasks.isNotEmpty()) { "模型没有生成有效任务" }
         val requestedWindow = parseWindow(root.optString("scheduleStart"), root.optString("scheduleEnd"))
         return AssistantPlan(
@@ -112,7 +133,7 @@ object AssistantPlanParser {
     fun fallback(input: String): AssistantPlan {
         if (!looksLikePlanning(input)) {
             return AssistantPlan(
-                summary = if (input.contains("你好") || input.contains("嗨")) "你好，我是你的规划助手。你可以和我聊天，也可以告诉我今天想完成什么。" else "我在。需要规划时，告诉我任务、可用时间或希望避开的时段。",
+            summary = if (input.contains("你好") || input.contains("嗨")) "你好。哼，终于想起和我打招呼了？本 GPT 娘在呢。想聊天就聊，要规划也尽管交给我。" else "本 GPT 娘在听。要规划的话，把任务、可用时间和想避开的时段说清楚，可别让我猜太久。",
                 tasks = emptyList(),
                 isPlanning = false
             )
@@ -122,7 +143,7 @@ object AssistantPlanParser {
             .ifEmpty { listOf("整理今天的学习计划") }
         val requestedWindow = extractWindow(input)
         return AssistantPlan(
-            summary = "模型暂不可用，已用本地规则生成草案；请在创建前检查名称和时长。",
+            summary = "模型暂时没接上，才不是我偷懒。本 GPT 娘先用本地规则整理了草案，创建前记得检查名称和时长。",
             tasks = parts.map { AssistantTaskSuggestion(title = it.take(60), minutes = 50) },
             requestedWindowStart = requestedWindow?.first,
             requestedWindowEnd = requestedWindow?.second,
@@ -138,7 +159,7 @@ object AssistantPlanParser {
         conversation: List<String> = emptyList(),
         currentDrafts: List<String> = emptyList()
     ): String = """
-        你是考研任务拆解助手。用户已明确要求创建、安排或细化具体任务。
+        你正在执行考研任务拆解。用户已明确要求创建、安排或细化具体任务。
         今天日期：$date
         用户长期预设：${preset.instructions}
         今天允许安排：${formatMinute(preset.windowStartMinute)} 至 ${formatMinute(preset.windowEndMinute)}
@@ -149,31 +170,17 @@ object AssistantPlanParser {
         本轮要求：$input
 
         只返回一个紧凑 JSON 对象，不要 Markdown或额外解释：
-        {"type":"plan","reply":"说明总工作量、预计天数和分天理由","scheduleStart":"17:00或空","scheduleEnd":"20:00或空","tasks":[{"title":"具体任务名","detail":"步骤和完成标准","label":"标签","priority":"HIGH/MEDIUM/LOW","minutes":50,"dayOffset":0}]}
-        dayOffset=0表示$date，1表示次日，以此类推，最多30。先估算完成整个目标真正需要的总时间；大任务必须按知识依赖和每日负荷拆到多天，每日学习任务原则上不超过360分钟，不得为了塞进一天而低估时长。只有用户明确要求当天全部完成时才集中到一天。最多12项。若用户要求细化上一批，参考待确认草案重新拆细。仅在本轮明确指定安排时段时填写开始和结束；minutes为10到480。排除吃饭、睡觉、游戏，不复制已有任务，不确定的信息写入detail提醒核对。
+        {"type":"plan","reply":"用GPT娘口吻说明总工作量、预计天数和分天理由","scheduleStart":"17:00或空","scheduleEnd":"20:00或空","tasks":[{"title":"具体任务名","detail":"步骤和完成标准","label":"标签","priority":"HIGH/MEDIUM/LOW","minutes":50,"dayOffset":0或null}]}
+        dayOffset=0表示$date，1表示次日，以此类推，最多30；没有明确执行日建议时可为null。任务拆解阶段必须直接生成可独立执行的时间块：每项30到120分钟，大任务按章节、题组或学习阶段拆成多个任务，之后的排程阶段不会再次拆分。先估算整个目标真正需要的总时间，每日学习任务原则上不超过360分钟，不得为了塞进一天而低估时长。只有用户明确要求当天全部完成时才集中到一天。最多16项。若用户说“再加”“追加”或“另外”，只生成本轮新增任务，不复制待确认草案和已有任务。若用户要求细化上一批，参考待确认草案重新拆细。仅在本轮明确指定安排时段时填写开始和结束；minutes使用10分钟整数倍。排除吃饭、睡觉、游戏，不确定的信息写入detail提醒核对。reply可以明显傲娇，任务名称、detail和完成标准必须保持客观清楚，不要加入语气词。
     """.trimIndent()
 
     fun distributeAcrossDays(plan: AssistantPlan, preset: AssistantPreset, forceSingleDay: Boolean = false): AssistantPlan {
-        if (!plan.isPlanning || plan.tasks.isEmpty() || forceSingleDay || plan.tasks.any { it.dayOffset > 0 }) return plan
+        if (!plan.isPlanning || plan.tasks.isEmpty()) return plan
         val availableMinutes = usableMinutesPerDay(preset).coerceAtMost(DEFAULT_DAILY_STUDY_LIMIT)
         if (availableMinutes < 10) return plan
-        val expanded = plan.tasks.flatMap { task ->
-            if (task.minutes <= availableMinutes) listOf(task)
-            else {
-                val partCount = (task.minutes + availableMinutes - 1) / availableMinutes
-                var remaining = task.minutes
-                List(partCount) { index ->
-                    val partMinutes = minOf(availableMinutes, remaining)
-                    remaining -= partMinutes
-                    task.copy(
-                        id = UUID.randomUUID().toString(),
-                        title = "${task.title}（第${index + 1}/$partCount 部分）",
-                        detail = task.detail.ifBlank { "按连续阶段完成并记录进度。" },
-                        minutes = partMinutes
-                    )
-                }
-            }
-        }
+        val maxBlockMinutes = minOf(MAX_EXECUTION_BLOCK_MINUTES, availableMinutes)
+        val expanded = plan.tasks.flatMap { splitIntoExecutionBlocks(it, maxBlockMinutes) }
+        if (forceSingleDay || plan.tasks.any { (it.dayOffset ?: 0) > 0 }) return plan.copy(tasks = expanded)
         val totalWithBreaks = expanded.sumOf { it.minutes } + (expanded.size - 1).coerceAtLeast(0) * 10
         if (totalWithBreaks <= availableMinutes) return plan.copy(tasks = expanded)
         var day = 0
@@ -187,7 +194,7 @@ object AssistantPlanParser {
             used += task.minutes + if (used == 0) 0 else 10
             task.copy(dayOffset = day.coerceAtMost(30))
         }
-        val days = distributed.maxOf { it.dayOffset } + 1
+        val days = distributed.maxOf { it.dayOffset ?: 0 } + 1
         return plan.copy(
             summary = "${plan.summary} 已按每日不超过约${availableMinutes}分钟调整为$days 天完成。",
             tasks = distributed
@@ -195,7 +202,7 @@ object AssistantPlanParser {
     }
 
     fun chatPrompt(input: String, conversation: List<String>): String = """
-        你是简洁自然的考研规划助手。现在只进行正常对话，不创建任务、不输出JSON。
+        现在只进行正常对话，不创建任务、不输出JSON。保持明显的二次元傲娇感，但先回答问题，不要用角色口吻掩盖信息。
         最近对话：${conversation.takeLast(6).joinToString(" | ").ifBlank { "无" }}
         用户：$input
     """.trimIndent()
@@ -220,6 +227,62 @@ object AssistantPlanParser {
         "LOW", "低" -> Priority.LOW
         else -> Priority.MEDIUM
     }
+
+    private fun findTaskArray(root: JSONObject): JSONArray? {
+        listOf("tasks", "taskList", "items", "t").forEach { key -> root.optJSONArray(key)?.let { return it } }
+        listOf("data", "plan", "result").forEach { key ->
+            val nested = root.optJSONObject(key) ?: return@forEach
+            listOf("tasks", "taskList", "items", "t").forEach { nestedKey -> nested.optJSONArray(nestedKey)?.let { return it } }
+        }
+        return null
+    }
+
+    private fun JSONObject.firstString(vararg keys: String): String {
+        keys.forEach { key ->
+            val value = opt(key).takeUnless { it == null || it == JSONObject.NULL }?.toString()?.trim().orEmpty()
+            if (value.isNotBlank() && !value.equals("null", ignoreCase = true)) return value
+        }
+        return ""
+    }
+
+    private fun JSONObject.taskMinutes(): Int {
+        val raw = listOf("minutes", "duration", "estimatedMinutes", "time").firstNotNullOfOrNull { key ->
+            opt(key).takeUnless { it == null || it == JSONObject.NULL }
+        } ?: return 50
+        val minutes = when (raw) {
+            is Number -> raw.toInt()
+            else -> {
+                val text = raw.toString().trim()
+                val number = Regex("\\d+(?:\\.\\d+)?").find(text)?.value?.toDoubleOrNull() ?: 50.0
+                if (text.contains("小时") || text.contains("hour", ignoreCase = true)) (number * 60).toInt() else number.toInt()
+            }
+        }
+        return roundTaskMinutes(minutes)
+    }
+
+    private fun JSONObject.optionalDayOffset(vararg keys: String): Int? {
+        val raw = keys.firstNotNullOfOrNull { key -> opt(key).takeUnless { it == null || it == JSONObject.NULL } } ?: return null
+        return raw.toString().toIntOrNull()?.coerceIn(0, 30)
+    }
+
+    private fun splitIntoExecutionBlocks(task: AssistantTaskSuggestion, maxMinutes: Int): List<AssistantTaskSuggestion> {
+        val totalMinutes = roundTaskMinutes(task.minutes)
+        if (totalMinutes <= maxMinutes) return listOf(task.copy(minutes = totalMinutes))
+        val partCount = (totalMinutes + maxMinutes - 1) / maxMinutes
+        val totalSlots = totalMinutes / 10
+        val baseSlots = totalSlots / partCount
+        val extraSlots = totalSlots % partCount
+        return List(partCount) { index ->
+            task.copy(
+                id = UUID.randomUUID().toString(),
+                title = "${task.title}（第${index + 1}/$partCount 块）",
+                detail = task.detail.ifBlank { "完成本块内容并记录进度，下一块从记录处继续。" },
+                minutes = (baseSlots + if (index < extraSlots) 1 else 0) * 10
+            )
+        }
+    }
+
+    private fun roundTaskMinutes(value: Int): Int = (((value.coerceIn(10, 480) + 9) / 10) * 10).coerceAtMost(480)
 
     private fun looksLikePlanning(input: String): Boolean = isPlanningRequest(input)
 
@@ -278,4 +341,9 @@ object AssistantPlanParser {
     }
 
     private const val DEFAULT_DAILY_STUDY_LIMIT = 6 * 60
+    private const val MAX_EXECUTION_BLOCK_MINUTES = 120
 }
+
+const val GPT_GIRL_SYSTEM_PROMPT = """
+你是 FocusPlan 里的 GPT娘，一名能力可靠、角色感明显的二次元傲娇规划助手。先给出准确结论，再用一两句嘴硬式关心或轻微吐槽增强角色感，可以自然使用“哼”“才不是”“可别”“本 GPT 娘”等表达。不要辱骂、贬低、威胁、占有用户，不要连续堆叠口头禅，不要牺牲信息清晰度。遇到失败时说明真实原因和可执行下一步，不甩锅。涉及任务名称、步骤、完成标准、时间和数据时使用中性、精确、可执行的文字。
+"""

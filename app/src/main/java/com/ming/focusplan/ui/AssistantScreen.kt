@@ -28,6 +28,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import kotlin.math.abs
 
 @Composable
@@ -42,9 +43,20 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     var showPreset by remember { mutableStateOf(false) }
     var selectedExisting by rememberSaveable { mutableStateOf(emptyList<Long>()) }
     var editingDraft by remember { mutableStateOf<Pair<String, AssistantTaskSuggestion>?>(null) }
+    var editingTask by remember { mutableStateOf<TaskEntity?>(null) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val availableExisting = tasks.filter { !it.completed && it.id !in scheduledIds }
+    val knownLabels = remember(tasks, state.draftBatches) {
+        (tasks.map { it.subject } + state.draftBatches.flatMap { batch -> batch.tasks.map { it.label } })
+            .filter { it.isNotBlank() && it != "未分类" }
+            .distinct()
+    }
+
+    LaunchedEffect(availableExisting.map { it.id }) {
+        val availableIds = availableExisting.mapTo(mutableSetOf()) { it.id }
+        selectedExisting = selectedExisting.filter { it in availableIds }
+    }
 
     Box(modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
@@ -71,7 +83,7 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
             PresetScheduleBar(preset, onClick = { showPreset = true })
 
             TabRow(selectedTabIndex = page) {
-                listOf("对话", "草案 ${state.suggestionCount}", "待办 ${availableExisting.size}").forEachIndexed { index, title ->
+                listOf("对话", "草案排程", "本地排程").forEachIndexed { index, title ->
                     Tab(selected = page == index, onClick = { page = index }, text = { Text(title, maxLines = 1) })
                 }
             }
@@ -89,8 +101,10 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 1 -> AssistantDraftsPage(
                     state = state,
                     onToggle = vm::toggleAssistantSuggestion,
+                    onSelectAll = vm::setAssistantBatchSelection,
                     onEdit = { batchId, suggestion -> editingDraft = batchId to suggestion },
                     onDeleteTask = vm::deleteAssistantSuggestion,
+                    onDeleteSelected = vm::deleteSelectedAssistantSuggestions,
                     onDeleteBatch = vm::deleteAssistantBatch,
                     onCreate = { batchId, schedule ->
                         vm.createAssistantSuggestions(batchId, schedule) { scope.launch { snackbar.showSnackbar(it) } }
@@ -101,8 +115,15 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     tasks = availableExisting,
                     selectedIds = selectedExisting,
                     onSelectionChange = { selectedExisting = it.distinct() },
+                    onOpen = { editingTask = it },
                     onSchedule = {
                         vm.scheduleExistingTasks(selectedExisting.toSet()) {
+                            selectedExisting = emptyList()
+                            scope.launch { snackbar.showSnackbar(it) }
+                        }
+                    },
+                    onDeleteSelected = {
+                        vm.deleteTasks(selectedExisting.toSet()) {
                             selectedExisting = emptyList()
                             scope.launch { snackbar.showSnackbar(it) }
                         }
@@ -119,10 +140,53 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         showPreset = false
     }
     editingDraft?.let { (batchId, draft) ->
-        EditSuggestionDialog(
-            suggestion = draft,
+        val batch = state.draftBatches.firstOrNull { it.id == batchId }
+        val baseDate = runCatching { LocalDate.parse(batch?.baseDate) }.getOrDefault(LocalDate.now())
+        TaskDetailsDialog(
+            initial = TaskEditorValue(
+                title = draft.title,
+                detail = draft.detail,
+                label = draft.label,
+                priority = draft.priority,
+                minutes = draft.minutes,
+                plannedDayEpoch = draft.dayOffset?.let { baseDate.plusDays(it.toLong()).toEpochDay() }
+            ),
+            knownLabels = knownLabels,
+            dialogTitle = "编辑并细化任务",
             onDismiss = { editingDraft = null },
-            onSave = { vm.updateAssistantSuggestion(batchId, it); editingDraft = null }
+            onSave = { value ->
+                val dayOffset = value.plannedDayEpoch?.let { ChronoUnit.DAYS.between(baseDate, LocalDate.ofEpochDay(it)).toInt().coerceIn(0, 30) }
+                vm.updateAssistantSuggestion(
+                    batchId,
+                    draft.copy(
+                        title = value.title,
+                        detail = value.detail,
+                        label = value.label,
+                        priority = value.priority,
+                        minutes = value.minutes,
+                        dayOffset = dayOffset
+                    )
+                )
+                editingDraft = null
+            }
+        )
+    }
+    editingTask?.let { task ->
+        TaskDetailsDialog(
+            initial = task.toEditorValue(),
+            knownLabels = knownLabels,
+            dialogTitle = "编辑并细化任务",
+            splitMessage = task.takeIf { it.parentTaskId != null }?.let {
+                "这是同一任务的关联分块。修改总时长后会融合未完成分块并生成新的排程预览。"
+            },
+            onDismiss = { editingTask = null },
+            onDelete = { vm.deleteTask(task); editingTask = null },
+            onSave = { value ->
+                vm.saveTask(task, value.title, value.detail, value.label, value.priority, value.minutes, value.plannedDayEpoch) {
+                    scope.launch { snackbar.showSnackbar(it) }
+                }
+                editingTask = null
+            }
         )
     }
 }
@@ -250,8 +314,10 @@ private fun AssistantChatPage(
 private fun AssistantDraftsPage(
     state: AssistantUiState,
     onToggle: (String, String) -> Unit,
+    onSelectAll: (String, Boolean) -> Unit,
     onEdit: (String, AssistantTaskSuggestion) -> Unit,
     onDeleteTask: (String, String) -> Unit,
+    onDeleteSelected: (String) -> Unit,
     onDeleteBatch: (String) -> Unit,
     onCreate: (String, Boolean) -> Unit,
     modifier: Modifier = Modifier
@@ -270,8 +336,10 @@ private fun AssistantDraftsPage(
                 DraftBatchCard(
                     batch = batch,
                     onToggle = { onToggle(batch.id, it) },
+                    onSelectAll = { onSelectAll(batch.id, it) },
                     onEdit = { onEdit(batch.id, it) },
                     onDeleteTask = { onDeleteTask(batch.id, it) },
+                    onDeleteSelected = { onDeleteSelected(batch.id) },
                     onDeleteBatch = { onDeleteBatch(batch.id) },
                     onCreate = { onCreate(batch.id, it) }
                 )
@@ -284,11 +352,16 @@ private fun AssistantDraftsPage(
 private fun DraftBatchCard(
     batch: AssistantDraftBatch,
     onToggle: (String) -> Unit,
+    onSelectAll: (Boolean) -> Unit,
     onEdit: (AssistantTaskSuggestion) -> Unit,
     onDeleteTask: (String) -> Unit,
+    onDeleteSelected: () -> Unit,
     onDeleteBatch: () -> Unit,
     onCreate: (Boolean) -> Unit
 ) {
+    val selectedCount = batch.tasks.count { it.selected }
+    val allSelected = batch.tasks.isNotEmpty() && selectedCount == batch.tasks.size
+    var deleteSelectionRequested by rememberSaveable(batch.id) { mutableStateOf(false) }
     OutlinedCard(Modifier.fillMaxWidth(), shape = RoundedCornerShape(6.dp)) {
         Column(Modifier.fillMaxWidth()) {
             Row(Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp, top = 10.dp), verticalAlignment = Alignment.Top) {
@@ -307,11 +380,22 @@ private fun DraftBatchCard(
                     color = MaterialTheme.colorScheme.primary
                 )
             }
+            Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = allSelected, onCheckedChange = onSelectAll)
+                    Text(if (allSelected) "取消全选" else "全选", fontWeight = FontWeight.SemiBold)
+                    Text("$selectedCount/${batch.tasks.size}", Modifier.weight(1f).padding(start = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    IconButton(onClick = { deleteSelectionRequested = true }, enabled = selectedCount > 0) {
+                        Icon(Icons.Default.Delete, "删除已选草案", tint = if (selectedCount > 0) MaterialTheme.colorScheme.error else LocalContentColor.current)
+                    }
+                }
+            }
             HorizontalDivider()
-            val sortedTasks = batch.tasks.sortedWith(compareBy<AssistantTaskSuggestion> { it.dayOffset }.thenByDescending { it.priority.rank })
-            var previousDay: Int? = null
+            val sortedTasks = batch.tasks.sortedWith(compareBy<AssistantTaskSuggestion> { it.dayOffset ?: Int.MAX_VALUE }.thenByDescending { it.priority.rank })
+            var previousDayKey = Int.MIN_VALUE
             sortedTasks.forEachIndexed { index, suggestion ->
-                if (previousDay != suggestion.dayOffset) {
+                val dayKey = suggestion.dayOffset ?: -1
+                if (previousDayKey != dayKey) {
                     Surface(color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.75f)) {
                         Text(
                             planDayLabel(batch.baseDate, suggestion.dayOffset),
@@ -321,7 +405,7 @@ private fun DraftBatchCard(
                             fontWeight = FontWeight.SemiBold
                         )
                     }
-                    previousDay = suggestion.dayOffset
+                    previousDayKey = dayKey
                 }
                 DraftTaskRow(suggestion, batch.baseDate, onToggle = { onToggle(suggestion.id) }, onEdit = { onEdit(suggestion) }, onDelete = { onDeleteTask(suggestion.id) })
                 if (index < sortedTasks.lastIndex) HorizontalDivider(Modifier.padding(start = 50.dp))
@@ -334,6 +418,21 @@ private fun DraftBatchCard(
                 }
             }
         }
+    }
+    if (deleteSelectionRequested) {
+        AlertDialog(
+            onDismissRequest = { deleteSelectionRequested = false },
+            icon = { Icon(Icons.Default.Delete, null) },
+            title = { Text("删除已选 $selectedCount 项草案？") },
+            text = { Text("只删除本轮中勾选的草案，不影响其他批次和已经创建的任务。") },
+            confirmButton = {
+                TextButton(
+                    onClick = { onDeleteSelected(); deleteSelectionRequested = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { deleteSelectionRequested = false }) { Text("取消") } }
+        )
     }
 }
 
@@ -352,82 +451,90 @@ private fun DraftTaskRow(suggestion: AssistantTaskSuggestion, baseDate: String, 
 }
 
 @Composable
-private fun EditSuggestionDialog(suggestion: AssistantTaskSuggestion, onDismiss: () -> Unit, onSave: (AssistantTaskSuggestion) -> Unit) {
-    var title by remember(suggestion.id) { mutableStateOf(suggestion.title) }
-    var detail by remember(suggestion.id) { mutableStateOf(suggestion.detail) }
-    var label by remember(suggestion.id) { mutableStateOf(suggestion.label) }
-    var priority by remember(suggestion.id) { mutableStateOf(suggestion.priority) }
-    var minutes by remember(suggestion.id) { mutableIntStateOf(suggestion.minutes) }
-    var dayOffset by remember(suggestion.id) { mutableIntStateOf(suggestion.dayOffset) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("编辑并细化任务") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("任务名称") }, maxLines = 2)
-                OutlinedTextField(detail, { detail = it }, Modifier.fillMaxWidth(), label = { Text("具体步骤与完成标准") }, minLines = 3, maxLines = 6)
-                OutlinedTextField(label, { label = it }, Modifier.fillMaxWidth(), label = { Text("标签") }, singleLine = true)
-                Text("优先级", style = MaterialTheme.typography.labelLarge)
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    Priority.entries.forEach { item -> FilterChip(selected = priority == item, onClick = { priority = item }, label = { Text(item.label) }) }
-                }
-                Text("预计时长", style = MaterialTheme.typography.labelLarge)
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-                    IconButton(onClick = { minutes = (minutes - 10).coerceAtLeast(10) }) { Text("−", style = MaterialTheme.typography.titleLarge) }
-                    Text("$minutes 分钟", Modifier.width(100.dp), fontWeight = FontWeight.SemiBold)
-                    IconButton(onClick = { minutes = (minutes + 10).coerceAtMost(480) }) { Icon(Icons.Default.Add, "增加10分钟") }
-                }
-                Text("执行日", style = MaterialTheme.typography.labelLarge)
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
-                    IconButton(onClick = { dayOffset = (dayOffset - 1).coerceAtLeast(0) }) { Text("−", style = MaterialTheme.typography.titleLarge) }
-                    Text(if (dayOffset == 0) "今天" else "第 ${dayOffset + 1} 天", Modifier.width(100.dp), fontWeight = FontWeight.SemiBold)
-                    IconButton(onClick = { dayOffset = (dayOffset + 1).coerceAtMost(30) }) { Icon(Icons.Default.Add, "后移一天") }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onSave(suggestion.copy(title = title.trim(), detail = detail.trim(), label = label.trim().ifBlank { "未分类" }, priority = priority, minutes = minutes, dayOffset = dayOffset)) },
-                enabled = title.isNotBlank()
-            ) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
-    )
-}
-
-@Composable
 private fun ExistingTasksPage(
     tasks: List<TaskEntity>,
     selectedIds: List<Long>,
     onSelectionChange: (List<Long>) -> Unit,
+    onOpen: (TaskEntity) -> Unit,
     onSchedule: () -> Unit,
+    onDeleteSelected: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val allSelected = tasks.isNotEmpty() && tasks.all { it.id in selectedIds }
+    var deleteSelectionRequested by rememberSaveable { mutableStateOf(false) }
     LazyColumn(modifier.fillMaxWidth(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         item(key = "existing-heading") {
             Column(Modifier.padding(bottom = 6.dp)) {
-                Text("未排程的已有待办", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text("选择后寻找今天的可用时间，不会移动已有时间块。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("本地任务智能排程", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("勾选任务后由智能体安排未来7天，不会移动其他已有时间块。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         if (tasks.isEmpty()) {
             item(key = "existing-empty") { Text("没有可加入时间轴的已有任务", Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
         } else {
-            items(tasks, key = { "assistant-existing-${it.id}" }) { task ->
-                val selected = task.id in selectedIds
-                ListItem(
-                    modifier = Modifier.clickable { onSelectionChange(if (selected) selectedIds - task.id else selectedIds + task.id) },
-                    headlineContent = { Text(task.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
-                    supportingContent = { Text("${task.subject} · ${Priority.fromRank(task.priority).label}优先 · ${task.estimatedMinutes}分钟") },
-                    leadingContent = { Checkbox(selected, onCheckedChange = { checked -> onSelectionChange(if (checked) selectedIds + task.id else selectedIds - task.id) }) }
-                )
+            item(key = "existing-select-all") {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        onSelectionChange(if (allSelected) emptyList() else tasks.map { it.id })
+                    },
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = allSelected,
+                            onCheckedChange = { checked -> onSelectionChange(if (checked) tasks.map { it.id } else emptyList()) }
+                        )
+                        Text("全选", fontWeight = FontWeight.SemiBold)
+                        Text("${selectedIds.size}/${tasks.size}", Modifier.weight(1f).padding(start = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (selectedIds.isNotEmpty()) TextButton(onClick = { onSelectionChange(emptyList()) }) { Text("清空") }
+                    }
+                }
             }
             item(key = "existing-action") {
-                Button(onClick = onSchedule, enabled = selectedIds.isNotEmpty(), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-                    Icon(Icons.Default.DateRange, null); Spacer(Modifier.width(6.dp)); Text("将所选任务加入时间轴")
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { deleteSelectionRequested = true },
+                        enabled = selectedIds.isNotEmpty(),
+                        modifier = Modifier.weight(0.8f),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Icon(Icons.Default.Delete, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("删除")
+                    }
+                    Button(onClick = onSchedule, enabled = selectedIds.isNotEmpty(), modifier = Modifier.weight(1.4f)) {
+                        Icon(Icons.Default.DateRange, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (selectedIds.isEmpty()) "智能排程" else "智能排程 ${selectedIds.size} 项", maxLines = 1)
+                    }
+                }
+            }
+            items(tasks, key = { "assistant-existing-${it.id}" }) { task ->
+                val selected = task.id in selectedIds
+                UnifiedTaskCard(task = task, onOpen = { onOpen(task) }, selected = selected) {
+                    Checkbox(
+                        checked = selected,
+                        onCheckedChange = { checked -> onSelectionChange(if (checked) selectedIds + task.id else selectedIds - task.id) }
+                    )
                 }
             }
         }
+    }
+    if (deleteSelectionRequested) {
+        AlertDialog(
+            onDismissRequest = { deleteSelectionRequested = false },
+            icon = { Icon(Icons.Default.Delete, null) },
+            title = { Text("删除所选 ${selectedIds.size} 项任务？") },
+            text = { Text("这些是本地真实任务，关联分块和时间轴安排也会一并删除。") },
+            confirmButton = {
+                TextButton(
+                    onClick = { onDeleteSelected(); deleteSelectionRequested = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { deleteSelectionRequested = false }) { Text("取消") } }
+        )
     }
 }
 
@@ -440,6 +547,129 @@ private fun AssistantNotice(text: String, error: Boolean = false) {
             Text(text, style = MaterialTheme.typography.bodySmall)
         }
     }
+}
+
+@Composable
+internal fun ScheduleProgressDialog(status: String) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("GPT 娘正在排程") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(34.dp), strokeWidth = 3.dp)
+                    Spacer(Modifier.width(14.dp))
+                    Text(status, style = MaterialTheme.typography.bodyLarge)
+                }
+                Text(
+                    "模型最迟等待45秒；若响应超时、截断或格式有误，会自动生成可检查的本地排程预览。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {}
+    )
+}
+
+@Composable
+internal fun ScheduleProposalDialog(
+    preview: SchedulePreviewState,
+    applying: Boolean,
+    status: String?,
+    onDismiss: () -> Unit,
+    onApply: () -> Unit
+) {
+    val taskByKey = preview.request.tasks.associateBy { it.key }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(preview.title) },
+        text = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (applying) {
+                    item(key = "proposal-applying") {
+                        Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(6.dp)) {
+                            Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.5.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Text(status ?: "正在写入时间轴…", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    }
+                }
+                item(key = "proposal-summary") {
+                    Text(preview.proposal.reply)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "排程来源：${preview.modelName}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    preview.proposal.validationNote?.let {
+                        Text("自动回退原因：$it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                preview.proposal.blocks
+                    .sortedWith(compareBy({ it.dayOffset }, { it.startMinute }))
+                    .forEach { block ->
+                        item(key = "proposal-block-${block.taskKey}-${block.partIndex}") {
+                            val task = taskByKey[block.taskKey]
+                            ListItem(
+                                headlineContent = { Text(task?.title ?: block.taskKey, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                                supportingContent = {
+                                    Text(
+                                        "${proposalDayLabel(preview.request.startDay, block.dayOffset)}  ${AssistantPlanParser.formatMinute(block.startMinute)} 至 ${AssistantPlanParser.formatMinute(block.startMinute + block.minutes)}"
+                                    )
+                                },
+                                trailingContent = {
+                                    Text(
+                                        if (block.partCount > 1) "${block.partIndex}/${block.partCount}\n${block.minutes}分" else "${block.minutes}分",
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                            )
+                        }
+                    }
+                if (preview.proposal.buffers.isNotEmpty()) {
+                    item(key = "proposal-buffers-title") {
+                        Text("普通机动留白", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    }
+                    preview.proposal.buffers.sortedWith(compareBy({ it.dayOffset }, { it.startMinute })).forEachIndexed { index, buffer ->
+                        item(key = "proposal-buffer-$index") {
+                            Text(
+                                "${proposalDayLabel(preview.request.startDay, buffer.dayOffset)}  ${AssistantPlanParser.formatMinute(buffer.startMinute)} 至 ${AssistantPlanParser.formatMinute(buffer.startMinute + buffer.minutes)}  ${buffer.reason}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                if (preview.proposal.unscheduled.isNotEmpty()) {
+                    item(key = "proposal-unscheduled-title") {
+                        Text("暂未排入", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.error)
+                    }
+                    preview.proposal.unscheduled.forEach { item ->
+                        item(key = "proposal-unscheduled-${item.taskKey}") {
+                            Text("${taskByKey[item.taskKey]?.title ?: item.taskKey}：${item.reason}", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onApply, enabled = !applying) {
+                if (applying) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(if (applying) "正在写入" else "确认写入时间轴")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !applying) { Text("返回调整") } }
+    )
 }
 
 @Composable
@@ -658,7 +888,8 @@ private fun formatBatchTime(epochMillis: Long): String = Instant.ofEpochMilli(ep
     .atZone(ZoneId.systemDefault())
     .format(DateTimeFormatter.ofPattern("MM月dd日 HH:mm"))
 
-private fun planDayLabel(baseDate: String, dayOffset: Int): String {
+private fun planDayLabel(baseDate: String, dayOffset: Int?): String {
+    if (dayOffset == null) return "执行日由智能体决定"
     val date = runCatching { LocalDate.parse(baseDate).plusDays(dayOffset.toLong()) }.getOrNull()
     val relative = when (dayOffset) {
         0 -> "今天"
@@ -667,6 +898,17 @@ private fun planDayLabel(baseDate: String, dayOffset: Int): String {
         else -> "第 ${dayOffset + 1} 天"
     }
     return date?.let { "$relative · ${it.monthValue}月${it.dayOfMonth}日" } ?: relative
+}
+
+private fun proposalDayLabel(startDay: LocalDate, dayOffset: Int): String {
+    val date = startDay.plusDays(dayOffset.toLong())
+    val relative = when (dayOffset) {
+        0 -> "今天"
+        1 -> "明天"
+        2 -> "后天"
+        else -> "第${dayOffset + 1}天"
+    }
+    return "$relative ${date.monthValue}月${date.dayOfMonth}日"
 }
 
 private fun centeredWheelIndex(state: androidx.compose.foundation.lazy.LazyListState, fallback: Int): Int {

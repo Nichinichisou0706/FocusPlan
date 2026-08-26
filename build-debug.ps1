@@ -31,8 +31,8 @@ try {
     $outputDir = Join-Path $projectRoot "dist"
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $projectRoot "app\build\outputs\apk\debug\app-debug.apk") `
-        -Destination (Join-Path $outputDir "FocusPlan-0.1.0-debug.apk") -Force
-    Write-Host "APK: $outputDir\FocusPlan-0.1.0-debug.apk"
+        -Destination (Join-Path $outputDir "FocusPlan-0.2.0-debug.apk") -Force
+    Write-Host "APK: $outputDir\FocusPlan-0.2.0-debug.apk"
 } finally {
     Pop-Location
 }

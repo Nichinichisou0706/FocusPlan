@@ -39,6 +39,7 @@ import com.ming.focusplan.data.TaskEntity
 import com.ming.focusplan.assistant.ExcludedTime
 import com.ming.focusplan.assistant.PLANNING_DAY_END_MINUTE
 import com.ming.focusplan.assistant.PLANNING_DAY_START_MINUTE
+import com.ming.focusplan.assistant.presetEffectiveOn
 import com.ming.focusplan.planning.Planner
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -86,10 +87,20 @@ fun TasksScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     var showEditor by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<TaskEntity?>(null) }
     var labelToDelete by remember { mutableStateOf<String?>(null) }
+    var batchSelecting by rememberSaveable { mutableStateOf(false) }
+    var selectedTaskIds by rememberSaveable { mutableStateOf(emptyList<Long>()) }
+    var deleteSelectionRequested by rememberSaveable { mutableStateOf(false) }
     val knownLabels = remember(labels, tasks) {
         (labels.map { it.name } + tasks.map { it.subject }).filter { it.isNotBlank() && it != "未分类" }.distinct()
     }
     val visibleTasks = if (screenState.page == 0) tasks.filterNot { it.completed } else tasks.filter { it.completed }
+    val allVisibleSelected = visibleTasks.isNotEmpty() && visibleTasks.all { it.id in selectedTaskIds }
+
+    LaunchedEffect(screenState.page, visibleTasks.map { it.id }) {
+        val visibleIds = visibleTasks.mapTo(mutableSetOf()) { it.id }
+        selectedTaskIds = selectedTaskIds.filter { it in visibleIds }
+        if (visibleTasks.isEmpty()) batchSelecting = false
+    }
 
     Column(modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(20.dp))
@@ -98,12 +109,51 @@ fun TasksScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 Text("任务", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text("${tasks.count { !it.completed }} 项待完成", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            FilledIconButton(onClick = { editing = null; showEditor = true }) { Icon(Icons.Default.Add, "新建任务") }
+            if (batchSelecting) {
+                TextButton(onClick = { batchSelecting = false; selectedTaskIds = emptyList() }) { Text("取消") }
+            } else {
+                FilledTonalButton(onClick = { batchSelecting = true }, enabled = visibleTasks.isNotEmpty()) {
+                    Icon(Icons.Default.CheckCircle, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("批量")
+                }
+                Spacer(Modifier.width(8.dp))
+                FilledIconButton(onClick = { editing = null; showEditor = true }) { Icon(Icons.Default.Add, "新建任务") }
+            }
         }
         Spacer(Modifier.height(12.dp))
         TabRow(selectedTabIndex = screenState.page) {
-            Tab(selected = screenState.page == 0, onClick = { vm.setTaskPage(0) }, text = { Text("未完成 ${tasks.count { !it.completed }}") })
-            Tab(selected = screenState.page == 1, onClick = { vm.setTaskPage(1) }, text = { Text("已完成 ${tasks.count { it.completed }}") })
+            Tab(selected = screenState.page == 0, onClick = { batchSelecting = false; selectedTaskIds = emptyList(); vm.setTaskPage(0) }, text = { Text("未完成 ${tasks.count { !it.completed }}") })
+            Tab(selected = screenState.page == 1, onClick = { batchSelecting = false; selectedTaskIds = emptyList(); vm.setTaskPage(1) }, text = { Text("已完成 ${tasks.count { it.completed }}") })
+        }
+        if (batchSelecting && visibleTasks.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(6.dp)) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = allVisibleSelected,
+                        onCheckedChange = { checked -> selectedTaskIds = if (checked) visibleTasks.map { it.id } else emptyList() }
+                    )
+                    Text("全选", fontWeight = FontWeight.SemiBold)
+                    Text("${selectedTaskIds.size}/${visibleTasks.size}", Modifier.weight(1f).padding(start = 8.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    IconButton(
+                        onClick = { deleteSelectionRequested = true },
+                        enabled = selectedTaskIds.isNotEmpty()
+                    ) {
+                        Icon(Icons.Default.Delete, "删除所选任务", tint = if (selectedTaskIds.isNotEmpty()) MaterialTheme.colorScheme.error else LocalContentColor.current)
+                    }
+                    FilledTonalButton(
+                        onClick = {
+                            vm.setTasksCompleted(selectedTaskIds.toSet(), completed = screenState.page == 0)
+                            selectedTaskIds = emptyList()
+                            batchSelecting = false
+                        },
+                        enabled = selectedTaskIds.isNotEmpty()
+                    ) {
+                        Text(if (screenState.page == 0) "标为完成" else "恢复")
+                    }
+                }
+            }
         }
         if (screenState.page == 0) {
             Spacer(Modifier.height(12.dp))
@@ -149,7 +199,23 @@ fun TasksScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 }
             } else if (screenState.page == 1) {
                 items(visibleTasks, key = { "completed-task-${it.id}" }) { task ->
-                    TaskCard(task = task, onClick = { editing = task; showEditor = true }, onToggle = { vm.toggle(task) })
+                    val selected = task.id in selectedTaskIds
+                    UnifiedTaskCard(
+                        task = task,
+                        selected = batchSelecting && selected,
+                        onOpen = {
+                            if (batchSelecting) selectedTaskIds = if (selected) selectedTaskIds - task.id else selectedTaskIds + task.id
+                            else { editing = task; showEditor = true }
+                        }
+                    ) {
+                        Checkbox(
+                            checked = if (batchSelecting) selected else task.completed,
+                            onCheckedChange = {
+                                if (batchSelecting) selectedTaskIds = if (it) selectedTaskIds + task.id else selectedTaskIds - task.id
+                                else vm.toggle(task)
+                            }
+                        )
+                    }
                 }
             } else {
                 val groups = if (screenState.grouping == 0) {
@@ -179,7 +245,23 @@ fun TasksScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                             }
                         } else {
                             items(group.tasks, key = { "${group.key}-task-${it.id}" }) { task ->
-                                TaskCard(task = task, onClick = { editing = task; showEditor = true }, onToggle = { vm.toggle(task) })
+                                val selected = task.id in selectedTaskIds
+                                UnifiedTaskCard(
+                                    task = task,
+                                    selected = batchSelecting && selected,
+                                    onOpen = {
+                                        if (batchSelecting) selectedTaskIds = if (selected) selectedTaskIds - task.id else selectedTaskIds + task.id
+                                        else { editing = task; showEditor = true }
+                                    }
+                                ) {
+                                    Checkbox(
+                                        checked = if (batchSelecting) selected else task.completed,
+                                        onCheckedChange = {
+                                            if (batchSelecting) selectedTaskIds = if (it) selectedTaskIds + task.id else selectedTaskIds - task.id
+                                            else vm.toggle(task)
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -189,16 +271,49 @@ fun TasksScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         }
     }
 
-    if (showEditor) TaskEditorDialog(
-        task = editing,
+    if (showEditor) TaskDetailsDialog(
+        initial = editing?.toEditorValue() ?: TaskEditorValue(),
         knownLabels = knownLabels,
+        dialogTitle = if (editing == null) "新建任务" else "编辑并细化任务",
+        splitMessage = editing?.takeIf { it.parentTaskId != null }?.let {
+            "这是同一任务的关联分块。名称、步骤、标签和优先级会同步到整组；修改总时长后会先生成重新排程预览。"
+        },
         onDismiss = { showEditor = false },
         onDelete = editing?.let { task -> { vm.deleteTask(task); showEditor = false } },
-        onSave = { title, type, priority, minutes ->
-            vm.saveTask(editing, title, type, priority, minutes)
+        onSave = { value ->
+            vm.saveTask(
+                existing = editing,
+                title = value.title,
+                detail = value.detail,
+                type = value.label,
+                priority = value.priority,
+                minutes = value.minutes,
+                plannedDayEpoch = value.plannedDayEpoch
+            )
             showEditor = false
         }
     )
+
+    if (deleteSelectionRequested) {
+        AlertDialog(
+            onDismissRequest = { deleteSelectionRequested = false },
+            icon = { Icon(Icons.Default.Delete, null) },
+            title = { Text("删除所选 ${selectedTaskIds.size} 项？") },
+            text = { Text("关联的任务分块和时间轴安排也会一并删除，此操作无法撤销。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.deleteTasks(selectedTaskIds.toSet())
+                        selectedTaskIds = emptyList()
+                        batchSelecting = false
+                        deleteSelectionRequested = false
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("删除") }
+            },
+            dismissButton = { TextButton(onClick = { deleteSelectionRequested = false }) { Text("取消") } }
+        )
+    }
 
     labelToDelete?.let { label ->
         AlertDialog(
@@ -240,106 +355,34 @@ private fun TaskGroupHeader(title: String, count: Int, expanded: Boolean, onTogg
     }
 }
 
-@Composable
-private fun TaskCard(task: TaskEntity, onClick: () -> Unit, onToggle: () -> Unit) {
-    val style = typeStyle(task.subject)
-    OutlinedCard(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth().heightIn(min = 98.dp),
-        shape = RoundedCornerShape(6.dp),
-        colors = CardDefaults.outlinedCardColors(containerColor = style.container)
-    ) {
-        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)).background(style.accent),
-                contentAlignment = Alignment.Center
-            ) { Text(style.glyph, color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(task.title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(4.dp))
-                Text("${task.subject}  ·  ${task.estimatedMinutes} 分钟  ·  ${Priority.fromRank(task.priority).label}优先", style = MaterialTheme.typography.bodySmall, color = style.accent)
-            }
-            Checkbox(checked = task.completed, onCheckedChange = { onToggle() })
-        }
-    }
-}
-
-@Composable
-private fun TaskEditorDialog(
-    task: TaskEntity?,
-    knownLabels: List<String>,
-    onDismiss: () -> Unit,
-    onDelete: (() -> Unit)?,
-    onSave: (String, String, Priority, Int) -> Unit
-) {
-    var title by remember(task?.id) { mutableStateOf(task?.title.orEmpty()) }
-    var type by remember(task?.id) { mutableStateOf(task?.subject?.takeUnless { it == "未分类" }.orEmpty()) }
-    var priority by remember(task?.id) { mutableStateOf(Priority.fromRank(task?.priority ?: Priority.MEDIUM.rank)) }
-    var minutesText by remember(task?.id) { mutableStateOf((task?.estimatedMinutes ?: 50).toString()) }
-    val minutes = minutesText.toIntOrNull()?.coerceIn(10, 480) ?: 0
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (task == null) "新建任务" else "编辑任务") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(title, { title = it }, label = { Text("任务名称") }, modifier = Modifier.fillMaxWidth(), maxLines = 2)
-                OutlinedTextField(type, { type = it }, label = { Text("合集标签（可选）") }, placeholder = { Text("留空即未分类，也可输入新标签") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    item { FilterChip(selected = type.isBlank(), onClick = { type = "" }, label = { Text("未分类") }) }
-                    items(knownLabels, key = { "type-$it" }) { item ->
-                        FilterChip(selected = type == item, onClick = { type = item }, label = { Text(item) })
-                    }
-                }
-                Text("优先级", style = MaterialTheme.typography.labelLarge)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Priority.entries.forEach { item -> FilterChip(selected = priority == item, onClick = { priority = item }, label = { Text(item.label) }) }
-                }
-                Text("预计时长", style = MaterialTheme.typography.labelLarge)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FilledTonalIconButton(onClick = { minutesText = (minutes.coerceAtLeast(20) - 10).toString() }) { Text("−") }
-                    OutlinedTextField(
-                        value = minutesText,
-                        onValueChange = { value -> if (value.all(Char::isDigit)) minutesText = value },
-                        modifier = Modifier.width(116.dp).padding(horizontal = 8.dp),
-                        suffix = { Text("分钟") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                    )
-                    FilledTonalIconButton(onClick = { minutesText = (minutes.coerceAtLeast(0) + 10).coerceAtMost(480).toString() }) { Icon(Icons.Default.Add, "增加时长") }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = { onSave(title, type, priority, minutes) }, enabled = title.isNotBlank() && minutes in 10..480) { Text("保存") } },
-        dismissButton = {
-            Row {
-                onDelete?.let { TextButton(onClick = it, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") } }
-                TextButton(onClick = onDismiss) { Text("取消") }
-            }
-        }
-    )
-}
-
 private enum class TimelineMode(val label: String) { DAY("日"), THREE_DAY("三日"), WEEK("周"), MONTH("月") }
 
 @Composable
 fun TimelineScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     val tasks by vm.tasks.collectAsState()
+    val labels by vm.labels.collectAsState()
     val blocks by vm.blocks.collectAsState()
     val scheduledIds by vm.scheduledTaskIds.collectAsState()
     val assistantPreset by vm.assistantPreset.collectAsState()
+    val assistantPresetHistory by vm.assistantPresetHistory.collectAsState()
     var mode by rememberSaveable { mutableStateOf(TimelineMode.DAY) }
     var selectedDateEpochDay by rememberSaveable { mutableLongStateOf(currentPlanningDate().toEpochDay()) }
     var selectedTaskId by rememberSaveable { mutableStateOf<Long?>(null) }
     var selectedBlock by remember { mutableStateOf<ScheduleBlockEntity?>(null) }
+    var editingTask by remember { mutableStateOf<TaskEntity?>(null) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val selectedDate = LocalDate.ofEpochDay(selectedDateEpochDay)
     val today = currentPlanningDate()
+    val selectedDatePreset = remember(assistantPresetHistory, selectedDateEpochDay, assistantPreset) {
+        presetEffectiveOn(assistantPresetHistory, selectedDateEpochDay, assistantPreset)
+    }
     val canPlaceTasks = !selectedDate.isBefore(today)
     val pending = tasks.filter { !it.completed && it.id !in scheduledIds }
     val taskById = tasks.associateBy { it.id }
+    val knownLabels = remember(labels, tasks) {
+        (labels.map { it.name } + tasks.map { it.subject }).filter { it.isNotBlank() && it != "未分类" }.distinct()
+    }
     val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
     LaunchedEffect(pending.map { it.id }) {
@@ -362,7 +405,8 @@ fun TimelineScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 onResetDay = {
                     vm.resetDay(selectedDate) { message -> scope.launch { snackbar.showSnackbar(message) } }
                 },
-                onTaskSelect = { selectedTaskId = if (selectedTaskId == it.id) null else it.id }
+                onTaskSelect = { selectedTaskId = if (selectedTaskId == it.id) null else it.id },
+                onTaskOpen = { selectedBlock = null; editingTask = it }
             )
         }
         val timeline: @Composable (Modifier) -> Unit = { timelineModifier ->
@@ -371,7 +415,7 @@ fun TimelineScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 mode = mode,
                 selectedDate = selectedDate,
                 blocks = blocks,
-                exclusions = assistantPreset.excludedTimes.filter { it.enabled },
+                exclusions = selectedDatePreset.excludedTimes.filter { it.enabled },
                 taskById = taskById,
                 selectedTask = pending.firstOrNull { it.id == selectedTaskId }.takeIf { canPlaceTasks },
                 allowBlockChanges = canPlaceTasks,
@@ -382,7 +426,10 @@ fun TimelineScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                         }
                     }
                 },
-                onBlockClick = { selectedBlock = it },
+                onBlockClick = { block ->
+                    selectedBlock = block
+                    editingTask = block.taskId?.let(taskById::get)
+                },
                 onDayClick = {
                     selectedDateEpochDay = it.toEpochDay()
                     mode = TimelineMode.DAY
@@ -405,13 +452,39 @@ fun TimelineScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(12.dp))
     }
 
-    selectedBlock?.let { block ->
-        val task = block.taskId?.let(taskById::get)
+    editingTask?.let { task ->
+        val block = selectedBlock?.takeIf { it.taskId == task.id }
+        TaskDetailsDialog(
+            initial = task.toEditorValue(),
+            knownLabels = knownLabels,
+            dialogTitle = "编辑并细化任务",
+            splitMessage = task.takeIf { it.parentTaskId != null }?.let {
+                "这是同一任务的关联分块。退回待办会融合整组未完成分块；修改总时长后会先显示重新排程预览。"
+            },
+            onDismiss = { editingTask = null; selectedBlock = null },
+            onDelete = { vm.deleteTask(task); editingTask = null; selectedBlock = null },
+            onReturnToPending = block?.let {
+                {
+                    vm.unschedule(it) { message -> scope.launch { snackbar.showSnackbar(message) } }
+                    editingTask = null
+                    selectedBlock = null
+                }
+            },
+            onSave = { value ->
+                vm.saveTask(task, value.title, value.detail, value.label, value.priority, value.minutes, value.plannedDayEpoch) {
+                    scope.launch { snackbar.showSnackbar(it) }
+                }
+                editingTask = null
+                selectedBlock = null
+            }
+        )
+    }
+    selectedBlock?.takeIf { editingTask == null }?.let { block ->
         AlertDialog(
             onDismissRequest = { selectedBlock = null },
             title = { Text(block.title) },
-            text = { Text("${task?.subject ?: "计划"}  ·  ${Planner.label(block.startAt)} 至 ${Planner.label(block.endAt)}  ·  ${Priority.fromRank(block.priority).label}优先") },
-            confirmButton = { TextButton(onClick = { vm.unschedule(block); selectedBlock = null }) { Text("退回待办") } },
+            text = { Text("计划 · ${Planner.label(block.startAt)} 至 ${Planner.label(block.endAt)} · ${Priority.fromRank(block.priority).label}优先") },
+            confirmButton = { TextButton(onClick = { vm.unschedule(block); selectedBlock = null }) { Text("移除时间块") } },
             dismissButton = { TextButton(onClick = { selectedBlock = null }) { Text("关闭") } }
         )
     }
@@ -430,7 +503,8 @@ private fun TimelineControls(
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onResetDay: () -> Unit,
-    onTaskSelect: (TaskEntity) -> Unit
+    onTaskSelect: (TaskEntity) -> Unit,
+    onTaskOpen: (TaskEntity) -> Unit
 ) {
     Column(modifier) {
         Spacer(Modifier.height(12.dp))
@@ -450,7 +524,7 @@ private fun TimelineControls(
             }
         }
         DateNavigator(title = timelineTitle(mode, selectedDate), isToday = isToday, onPrevious = onPrevious, onNext = onNext)
-        PendingTaskTray(pending, selectedTaskId.takeIf { allowTaskSelection }, allowTaskSelection, onTaskSelect)
+        PendingTaskTray(pending, selectedTaskId.takeIf { allowTaskSelection }, allowTaskSelection, onTaskSelect, onTaskOpen)
     }
 }
 
@@ -473,20 +547,16 @@ private fun TimelineContent(
             TimelineMode.DAY -> DayTimeline(
                 date = selectedDate,
                 blocks = blocksForPlanningDay(blocks, selectedDate),
-                exclusions = if (selectedDate == currentPlanningDate()) {
-                    exclusionsForPlanningDay(exclusions, selectedDate)
-                } else {
-                    emptyList()
-                },
+                exclusions = exclusionsForPlanningDay(exclusions, selectedDate),
                 taskById = taskById,
                 selectedTask = selectedTask,
                 onPlace = onPlace,
                 onBlockClick = onBlockClick.takeIf { allowBlockChanges }
             )
-            TimelineMode.THREE_DAY -> MultiDayTimeline(selectedDate, 3, blocks, taskById, onDayClick)
+            TimelineMode.THREE_DAY -> MultiDayTimeline(selectedDate, 3, blocks, taskById, onDayClick, onBlockClick)
             TimelineMode.WEEK -> {
                 val monday = selectedDate.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
-                MultiDayTimeline(monday, 7, blocks, taskById, onDayClick)
+                MultiDayTimeline(monday, 7, blocks, taskById, onDayClick, onBlockClick)
             }
             TimelineMode.MONTH -> MonthTimeline(selectedDate, blocks, taskById, onDayClick)
         }
@@ -511,7 +581,13 @@ private fun DateNavigator(title: String, isToday: Boolean, onPrevious: () -> Uni
 }
 
 @Composable
-private fun PendingTaskTray(tasks: List<TaskEntity>, selectedId: Long?, enabled: Boolean, onSelect: (TaskEntity) -> Unit) {
+private fun PendingTaskTray(
+    tasks: List<TaskEntity>,
+    selectedId: Long?,
+    enabled: Boolean,
+    onSelect: (TaskEntity) -> Unit,
+    onOpen: (TaskEntity) -> Unit
+) {
     Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)).padding(vertical = 8.dp)) {
         Text("待安排  ${tasks.size}", Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelLarge)
         if (!enabled) {
@@ -522,31 +598,18 @@ private fun PendingTaskTray(tasks: List<TaskEntity>, selectedId: Long?, enabled:
             Box(Modifier.fillMaxWidth().height(82.dp), contentAlignment = Alignment.Center) { Text("待办区为空", color = MaterialTheme.colorScheme.onSurfaceVariant) }
         } else {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(tasks, key = { "pending-${it.id}" }) { task -> PendingBrick(task, selectedId == task.id, enabled) { onSelect(task) } }
+                items(tasks, key = { "pending-${it.id}" }) { task ->
+                    PendingBrick(task, selectedId == task.id, enabled, onOpen = { onOpen(task) }, onSelect = { onSelect(task) })
+                }
             }
         }
     }
 }
 
 @Composable
-private fun PendingBrick(task: TaskEntity, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
-    val style = typeStyle(task.subject)
-    OutlinedCard(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier.width(196.dp).height(92.dp).then(if (selected) Modifier.border(2.dp, style.accent, RoundedCornerShape(6.dp)) else Modifier),
-        shape = RoundedCornerShape(6.dp),
-        colors = CardDefaults.outlinedCardColors(containerColor = style.container)
-    ) {
-        Row(Modifier.fillMaxSize().padding(10.dp)) {
-            Box(Modifier.size(34.dp).clip(RoundedCornerShape(4.dp)).background(style.accent), contentAlignment = Alignment.Center) { Text(style.glyph, color = Color.White, fontWeight = FontWeight.Bold) }
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f)) {
-                Text(task.title, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.weight(1f))
-                Text("${task.subject} · ${task.estimatedMinutes}分钟 · ${Priority.fromRank(task.priority).label}", style = MaterialTheme.typography.labelSmall, color = style.accent, maxLines = 1)
-            }
-        }
+private fun PendingBrick(task: TaskEntity, selected: Boolean, enabled: Boolean, onOpen: () -> Unit, onSelect: () -> Unit) {
+    UnifiedTaskCard(task = task, onOpen = onOpen, modifier = Modifier.width(246.dp), selected = selected) {
+        Checkbox(checked = selected, onCheckedChange = { onSelect() }, enabled = enabled)
     }
 }
 
@@ -750,7 +813,8 @@ private fun MultiDayTimeline(
     days: Int,
     allBlocks: List<ScheduleBlockEntity>,
     taskById: Map<Long, TaskEntity>,
-    onDayClick: (LocalDate) -> Unit
+    onDayClick: (LocalDate) -> Unit,
+    onBlockClick: (ScheduleBlockEntity) -> Unit
 ) {
     Row(Modifier.fillMaxSize().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         repeat(days) { offset ->
@@ -769,7 +833,7 @@ private fun MultiDayTimeline(
                 HorizontalDivider()
                 if (dayBlocks.isEmpty()) Box(Modifier.fillMaxWidth().height(80.dp), contentAlignment = Alignment.Center) { Text("无安排", color = MaterialTheme.colorScheme.onSurfaceVariant) }
                 else dayBlocks.forEach { block ->
-                    Box(Modifier.padding(vertical = 4.dp)) { ScheduleBrick(block, block.taskId?.let(taskById::get), 96.dp, null) }
+                    Box(Modifier.padding(vertical = 4.dp)) { ScheduleBrick(block, block.taskId?.let(taskById::get), 96.dp, onBlockClick) }
                 }
             }
         }

@@ -40,6 +40,7 @@ import java.time.LocalDate
 @Composable
 fun FocusPlanApp(container: AppContainer) {
     val vm: MainViewModel = viewModel(factory = MainViewModelFactory(container))
+    val context = LocalContext.current
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val tasks by vm.tasks.collectAsState()
     val blocks by vm.blocks.collectAsState()
@@ -58,7 +59,7 @@ fun FocusPlanApp(container: AppContainer) {
     }
     val mood = when {
         tab == 3 && assistantState.error != null -> MascotMood.BLOCKED
-        tab == 3 && assistantState.loading -> MascotMood.WORKING
+        tab == 3 && (assistantState.loading || assistantState.scheduling) -> MascotMood.WORKING
         tab == 3 -> MascotMood.WELCOME
         tab == 2 || hasActiveTask -> MascotMood.WORKING
         tasks.isNotEmpty() && tasks.all { it.completed } -> MascotMood.REVIEW
@@ -67,62 +68,86 @@ fun FocusPlanApp(container: AppContainer) {
     }
 
     FocusPlanBackdrop(mood) {
-        if (isLandscape) {
-            Row(Modifier.fillMaxSize()) {
-                NavigationRail(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)) {
-                    Spacer(Modifier.height(8.dp))
-                    BrandMark(Modifier.size(44.dp))
-                    Spacer(Modifier.height(8.dp))
-                    destinations.forEachIndexed { index, item ->
-                        NavigationRailItem(
-                            selected = tab == index,
-                            onClick = { tab = index },
-                            icon = { DestinationIcon(item, selected = tab == index) },
-                            label = { Text(item.label) },
-                            colors = NavigationRailItemDefaults.colors(
-                                selectedIconColor = MaterialTheme.colorScheme.primary,
-                                selectedTextColor = MaterialTheme.colorScheme.primary,
-                                indicatorColor = if (mood == MascotMood.BLOCKED) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer
-                            )
-                        )
-                    }
-                }
-                FocusPlanContent(tab, vm, Modifier.weight(1f).fillMaxHeight())
-            }
-        } else {
-            Scaffold(
-                containerColor = Color.Transparent,
-                bottomBar = {
-                    Column {
-                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
-                        NavigationBar(
-                            modifier = Modifier.height(78.dp),
-                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
-                            tonalElevation = 0.dp
-                        ) {
-                            destinations.forEachIndexed { index, item ->
-                                NavigationBarItem(
-                                    selected = tab == index,
-                                    onClick = { tab = index },
-                                    icon = { DestinationIcon(item, selected = tab == index) },
-                                    label = { Text(item.label, maxLines = 1) },
-                                    alwaysShowLabel = true,
-                                    colors = NavigationBarItemDefaults.colors(
-                                        selectedIconColor = MaterialTheme.colorScheme.primary,
-                                        selectedTextColor = MaterialTheme.colorScheme.primary,
-                                        indicatorColor = if (mood == MascotMood.BLOCKED) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer,
-                                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+        Box(Modifier.fillMaxSize()) {
+            if (isLandscape) {
+                Row(Modifier.fillMaxSize()) {
+                    NavigationRail(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)) {
+                        Spacer(Modifier.height(8.dp))
+                        BrandMark(Modifier.size(44.dp))
+                        Spacer(Modifier.height(8.dp))
+                        destinations.forEachIndexed { index, item ->
+                            NavigationRailItem(
+                                selected = tab == index,
+                                onClick = { tab = index },
+                                icon = { DestinationIcon(item, selected = tab == index) },
+                                label = { Text(item.label) },
+                                colors = NavigationRailItemDefaults.colors(
+                                    selectedIconColor = MaterialTheme.colorScheme.primary,
+                                    selectedTextColor = MaterialTheme.colorScheme.primary,
+                                    indicatorColor = if (mood == MascotMood.BLOCKED) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer
                                 )
+                            )
+                        }
+                    }
+                    FocusPlanContent(tab, vm, Modifier.weight(1f).fillMaxHeight())
+                }
+            } else {
+                Scaffold(
+                    containerColor = Color.Transparent,
+                    bottomBar = {
+                        Column {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+                            NavigationBar(
+                                modifier = Modifier.height(78.dp),
+                                containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f),
+                                tonalElevation = 0.dp
+                            ) {
+                                destinations.forEachIndexed { index, item ->
+                                    NavigationBarItem(
+                                        selected = tab == index,
+                                        onClick = { tab = index },
+                                        icon = { DestinationIcon(item, selected = tab == index) },
+                                        label = { Text(item.label, maxLines = 1) },
+                                        alwaysShowLabel = true,
+                                        colors = NavigationBarItemDefaults.colors(
+                                            selectedIconColor = MaterialTheme.colorScheme.primary,
+                                            selectedTextColor = MaterialTheme.colorScheme.primary,
+                                            indicatorColor = if (mood == MascotMood.BLOCKED) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer,
+                                            unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    )
+                                }
                             }
                         }
                     }
+                ) { padding ->
+                    FocusPlanContent(tab, vm, Modifier.padding(padding))
                 }
-            ) { padding ->
-                FocusPlanContent(tab, vm, Modifier.padding(padding))
             }
+            FloatingMascotPet(
+                startInset = if (isLandscape) 88.dp else 12.dp,
+                bottomInset = if (isLandscape) 12.dp else 90.dp
+            )
         }
+    }
+    assistantState.schedulePreview?.let { preview ->
+        ScheduleProposalDialog(
+            preview = preview,
+            applying = assistantState.scheduling,
+            status = assistantState.scheduleStatus,
+            onDismiss = vm::dismissSchedulePreview,
+            onApply = {
+                vm.applySchedulePreview { message ->
+                    android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        )
+    }
+    if (assistantState.scheduling && assistantState.schedulePreview == null) {
+        ScheduleProgressDialog(
+            status = assistantState.scheduleStatus ?: "正在准备智能排程…"
+        )
     }
 }
 

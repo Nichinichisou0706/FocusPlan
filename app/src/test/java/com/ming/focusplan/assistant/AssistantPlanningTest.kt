@@ -7,6 +7,20 @@ import java.time.LocalDate
 
 class AssistantPlanningTest {
     @Test
+    fun presetHistoryKeepsPastDaysAndChangesCurrentAndFutureDays() {
+        val oldPreset = AssistantPreset(excludedTimes = listOf(ExcludedTime("旧午休", 13 * 60, 14 * 60)))
+        val newPreset = AssistantPreset(excludedTimes = listOf(ExcludedTime("新午休", 14 * 60, 16 * 60)))
+        val history = listOf(
+            AssistantPresetRevision(Long.MIN_VALUE, oldPreset),
+            AssistantPresetRevision(100, newPreset)
+        )
+
+        assertEquals(oldPreset, presetEffectiveOn(history, 99, newPreset))
+        assertEquals(newPreset, presetEffectiveOn(history, 100, oldPreset))
+        assertEquals(newPreset, presetEffectiveOn(history, 120, oldPreset))
+    }
+
+    @Test
     fun planningClockMapsAfterMidnightIntoSixToTwoTimeline() {
         assertEquals(PLANNING_DAY_START_MINUTE, normalizePlanningMinute(6 * 60))
         assertEquals(25 * 60, normalizePlanningMinute(60))
@@ -53,8 +67,8 @@ class AssistantPlanningTest {
 
         val distributed = AssistantPlanParser.distributeAcrossDays(plan, AssistantPreset())
 
-        assertTrue(distributed.tasks.any { it.dayOffset > 0 })
-        assertEquals(1, distributed.tasks.maxOf { it.dayOffset })
+        assertTrue(distributed.tasks.any { (it.dayOffset ?: 0) > 0 })
+        assertEquals(1, distributed.tasks.maxOf { it.dayOffset ?: 0 })
         assertTrue(distributed.summary.contains("2 天"))
     }
 
@@ -87,5 +101,31 @@ class AssistantPlanningTest {
         assertTrue(!prompt.contains("娱乐 12:00-13:00"))
         assertTrue(prompt.contains("英语单词"))
         assertTrue(prompt.contains("下午效率更高"))
+    }
+
+    @Test
+    fun parserAcceptsCommonTaskFieldAliases() {
+        val plan = AssistantPlanParser.parse(
+            """{"type":"plan","summary":"新增高数","taskList":[{"name":"高数第一单元","description":"看课并完成例题","category":"高数","level":"高","duration":"2小时","day":1}]}"""
+        )
+
+        assertEquals(1, plan.tasks.size)
+        assertEquals("高数第一单元", plan.tasks.single().title)
+        assertEquals(120, plan.tasks.single().minutes)
+        assertEquals(1, plan.tasks.single().dayOffset)
+    }
+
+    @Test
+    fun taskBreakdownCreatesExecutionBlocksBeforeScheduling() {
+        val plan = AssistantPlan(
+            summary = "完成两单元",
+            tasks = listOf(AssistantTaskSuggestion(title = "高数两单元", minutes = 240))
+        )
+
+        val prepared = AssistantPlanParser.distributeAcrossDays(plan, AssistantPreset(), forceSingleDay = true)
+
+        assertEquals(2, prepared.tasks.size)
+        assertEquals(listOf(120, 120), prepared.tasks.map { it.minutes })
+        assertTrue(prepared.tasks.all { it.title.contains("块") })
     }
 }

@@ -10,12 +10,35 @@ class AssistantPreferences(context: Context) {
 
     fun load(): AssistantPreset = runCatching {
         val root = JSONObject(preferences.getString(KEY_PRESET, null) ?: return AssistantPreset())
+        presetFromJson(root)
+    }.getOrDefault(AssistantPreset())
+
+    fun loadPresetHistory(fallback: AssistantPreset): List<AssistantPresetRevision> = runCatching {
+        val raw = preferences.getString(KEY_PRESET_HISTORY, null)
+            ?: return listOf(AssistantPresetRevision(PRESET_BASELINE_DAY_EPOCH, fallback))
+        val array = JSONArray(raw)
+        buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val presetJson = item.optJSONObject("preset") ?: continue
+                add(
+                    AssistantPresetRevision(
+                        effectiveDayEpoch = item.optLong("effectiveDay", PRESET_BASELINE_DAY_EPOCH),
+                        preset = presetFromJson(presetJson)
+                    )
+                )
+            }
+        }.distinctBy { it.effectiveDayEpoch }.sortedBy { it.effectiveDayEpoch }
+            .ifEmpty { listOf(AssistantPresetRevision(PRESET_BASELINE_DAY_EPOCH, fallback)) }
+    }.getOrDefault(listOf(AssistantPresetRevision(PRESET_BASELINE_DAY_EPOCH, fallback)))
+
+    private fun presetFromJson(root: JSONObject): AssistantPreset {
         val excluded = root.optJSONArray("excluded") ?: JSONArray()
         val loadedStart = root.optInt("windowStart", PLANNING_DAY_START_MINUTE)
             .coerceIn(PLANNING_DAY_START_MINUTE, PLANNING_DAY_END_MINUTE - 10)
         val loadedEnd = normalizePlanningMinute(root.optInt("windowEnd", PLANNING_DAY_END_MINUTE))
             .coerceIn(loadedStart + 10, PLANNING_DAY_END_MINUTE)
-        AssistantPreset(
+        return AssistantPreset(
             instructions = root.optString("instructions").ifBlank { AssistantPreset().instructions },
             windowStartMinute = loadedStart,
             windowEndMinute = loadedEnd,
@@ -39,9 +62,25 @@ class AssistantPreferences(context: Context) {
                 }
             }
         )
-    }.getOrDefault(AssistantPreset())
+    }
 
-    fun save(preset: AssistantPreset) {
+    fun save(preset: AssistantPreset, history: List<AssistantPresetRevision>) {
+        val historyJson = JSONArray().apply {
+            history.sortedBy { it.effectiveDayEpoch }.forEach { revision ->
+                put(
+                    JSONObject()
+                        .put("effectiveDay", revision.effectiveDayEpoch)
+                        .put("preset", presetToJson(revision.preset))
+                )
+            }
+        }
+        preferences.edit()
+            .putString(KEY_PRESET, presetToJson(preset).toString())
+            .putString(KEY_PRESET_HISTORY, historyJson.toString())
+            .apply()
+    }
+
+    private fun presetToJson(preset: AssistantPreset): JSONObject {
         val excluded = JSONArray().apply {
             preset.excludedTimes.forEach { item ->
                 put(
@@ -59,7 +98,7 @@ class AssistantPreferences(context: Context) {
             .put("windowStart", preset.windowStartMinute)
             .put("windowEnd", preset.windowEndMinute)
             .put("excluded", excluded)
-        preferences.edit().putString(KEY_PRESET, root.toString()).apply()
+        return root
     }
 
     fun loadWorkspace(now: Long = System.currentTimeMillis()): AssistantWorkspace = runCatching {
@@ -100,7 +139,7 @@ class AssistantPreferences(context: Context) {
                                 label = task.optString("label").ifBlank { "未分类" },
                                 priority = runCatching { Priority.valueOf(task.optString("priority")) }.getOrDefault(Priority.MEDIUM),
                                 minutes = task.optInt("minutes", 50).coerceIn(10, 480),
-                                dayOffset = task.optInt("dayOffset", 0).coerceIn(0, 30),
+                                dayOffset = if (task.has("dayOffset") && !task.isNull("dayOffset")) task.optInt("dayOffset", 0).coerceIn(0, 30) else null,
                                 selected = task.optBoolean("selected", true)
                             )
                         )
@@ -155,7 +194,7 @@ class AssistantPreferences(context: Context) {
                                 .put("label", task.label)
                                 .put("priority", task.priority.name)
                                 .put("minutes", task.minutes)
-                                .put("dayOffset", task.dayOffset)
+                                .put("dayOffset", task.dayOffset ?: JSONObject.NULL)
                                 .put("selected", task.selected)
                         )
                     }
@@ -181,7 +220,9 @@ class AssistantPreferences(context: Context) {
 
     companion object {
         private const val KEY_PRESET = "preset"
+        private const val KEY_PRESET_HISTORY = "preset_history"
         private const val KEY_WORKSPACE = "workspace"
+        private const val PRESET_BASELINE_DAY_EPOCH = Long.MIN_VALUE
         private const val HISTORY_RETENTION_MILLIS = 7L * 24 * 60 * 60 * 1000
         private const val MAX_DRAFT_BATCHES = 40
     }

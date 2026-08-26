@@ -7,7 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [TaskEntity::class, TaskLabelEntity::class, ScheduleBlockEntity::class, ModelProfileEntity::class], version = 2, exportSchema = false)
+@Database(entities = [TaskEntity::class, TaskLabelEntity::class, ScheduleBlockEntity::class, ModelProfileEntity::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun taskDao(): TaskDao
     abstract fun taskLabelDao(): TaskLabelDao
@@ -27,6 +27,19 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        private val migration2To3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE tasks ADD COLUMN detail TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN plannedDayEpoch INTEGER")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN parentTaskId INTEGER")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN splitGroupId TEXT")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN splitIndex INTEGER")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN splitCount INTEGER")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE tasks ADD COLUMN originalMinutes INTEGER")
+            }
+        }
+
         private val seedLabels = object : Callback() {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 super.onCreate(db)
@@ -38,6 +51,6 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun create(context: Context): AppDatabase = Room.databaseBuilder(
             context, AppDatabase::class.java, "focus-plan.db"
-        ).addMigrations(migration1To2).addCallback(seedLabels).build()
+        ).addMigrations(migration1To2, migration2To3).addCallback(seedLabels).build()
     }
 }

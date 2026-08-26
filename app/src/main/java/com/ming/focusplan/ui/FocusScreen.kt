@@ -65,6 +65,7 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val tasks by vm.tasks.collectAsState()
+    val labels by vm.labels.collectAsState()
     val blocks by vm.blocks.collectAsState()
     val selectedTaskId by vm.selectedFocusTaskId.collectAsState()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -75,6 +76,7 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     var permissionRefresh by remember { mutableIntStateOf(0) }
     var pendingStart by remember { mutableStateOf<Intent?>(null) }
     var designMode by rememberSaveable { mutableIntStateOf(0) }
+    var editingTask by remember { mutableStateOf<TaskEntity?>(null) }
     val customPlan = remember { mutableStateListOf<PomodoroSegment>() }
 
     val notificationGranted = permissionRefresh.let { hasNotificationPermission(context) }
@@ -115,6 +117,9 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     val presetPlan = if (taskMinutes > 0) PomodoroPlanner.plan(taskMinutes) else emptyList()
     val selectedPlan = if (designMode == 0) presetPlan else customPlan.toList()
     val customPlanValid = PomodoroPlanner.isValidCustomPlan(selectedPlan, taskMinutes)
+    val knownLabels = remember(labels, tasks) {
+        (labels.map { it.name } + tasks.map { it.subject }).filter { it.isNotBlank() && it != "未分类" }.distinct()
+    }
 
     LaunchedEffect(todayBlocks.map { it.id }, recommendedBlock?.id, selectedTaskId) {
         if (selectedBlock == null) vm.selectFocusTask((recommendedBlock ?: todayBlocks.firstOrNull())?.taskId)
@@ -227,6 +232,7 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     customPlan.addAll(presetPlan)
                 },
                 canStart = !timerState.running && (designMode == 0 || customPlanValid),
+                onOpenTask = { editingTask = selectedTask },
                 onStart = {
                     requestStart(
                         Intent(context, FocusTimerService::class.java)
@@ -275,6 +281,31 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     }
 
     if (showWhitelist) WhitelistDialog(context, onDismiss = { showWhitelist = false }) { permissionRefresh++ }
+    editingTask?.let { task ->
+        val taskBlock = todayBlocks.firstOrNull { it.taskId == task.id }
+        TaskDetailsDialog(
+            initial = task.toEditorValue(),
+            knownLabels = knownLabels,
+            dialogTitle = "编辑并细化任务",
+            splitMessage = task.takeIf { it.parentTaskId != null }?.let {
+                "这是同一任务的关联分块。退回待办会融合整组未完成分块。"
+            },
+            onDismiss = { editingTask = null },
+            onDelete = { vm.deleteTask(task); editingTask = null },
+            onReturnToPending = taskBlock?.let {
+                {
+                    vm.unschedule(it) { message -> android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show() }
+                    editingTask = null
+                }
+            },
+            onSave = { value ->
+                vm.saveTask(task, value.title, value.detail, value.label, value.priority, value.minutes, value.plannedDayEpoch) { message ->
+                    android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+                }
+                editingTask = null
+            }
+        )
+    }
 }
 
 @Composable
@@ -335,9 +366,11 @@ private fun TaskPomodoroPanel(
     onUpdateCustomPlan: (List<PomodoroSegment>) -> Unit,
     onResetCustom: () -> Unit,
     canStart: Boolean,
+    onOpenTask: () -> Unit,
     onStart: () -> Unit
 ) {
     Surface(
+        onClick = onOpenTask,
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(6.dp),
         color = MaterialTheme.colorScheme.surface,
