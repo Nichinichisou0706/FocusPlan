@@ -54,7 +54,7 @@ Android Studio 打开项目后，等待 Gradle Sync 完成，连接已开启 USB
 .\build-debug.ps1
 ```
 
-脚本会运行单元测试、Lint 和 Debug 构建，输出位置为 `dist/FocusPlan-0.2.0-debug.apk`。`dist` 不纳入 Git，发布包见 GitHub Releases。
+脚本会运行单元测试、Lint 和 Debug 构建，输出位置为 `dist/FocusPlan-0.2.1-debug.apk`。`dist` 不纳入 Git，发布包见 GitHub Releases。
 
 若 PowerShell 阻止本地脚本，可在当前窗口执行：
 

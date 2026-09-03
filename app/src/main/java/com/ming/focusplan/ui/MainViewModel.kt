@@ -27,6 +27,7 @@ data class TaskScreenState(
 data class AssistantUiState(
     val messages: List<AssistantConversationMessage> = emptyList(),
     val draftBatches: List<AssistantDraftBatch> = emptyList(),
+    val memoryResetAt: Long = 0L,
     val loading: Boolean = false,
     val scheduling: Boolean = false,
     val scheduleStatus: String? = null,
@@ -64,6 +65,8 @@ data class PendingTaskEdit(
 )
 
 class MainViewModel(private val container: AppContainer) : ViewModel() {
+    private class NoSchedulableDraftsException(message: String) : IllegalStateException(message)
+
     val tasks = container.tasks.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     val labels = container.labels.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     val models = container.models.observeAll().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -86,7 +89,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     val assistantPresetHistory = _assistantPresetHistory.asStateFlow()
     private val initialAssistantWorkspace = container.assistantPreferences.loadWorkspace()
     private val _assistantUiState = MutableStateFlow(
-        AssistantUiState(messages = initialAssistantWorkspace.messages, draftBatches = initialAssistantWorkspace.draftBatches)
+        AssistantUiState(
+            messages = initialAssistantWorkspace.messages,
+            draftBatches = initialAssistantWorkspace.draftBatches,
+            memoryResetAt = initialAssistantWorkspace.memoryResetAt
+        )
     )
     val assistantUiState = _assistantUiState.asStateFlow()
 
@@ -126,9 +133,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         val request = input.trim()
         if (request.isBlank() || _assistantUiState.value.loading) return
         val planningRequest = AssistantPlanParser.isPlanningRequest(request)
-        val conversationHistory = _assistantUiState.value.messages.takeLast(6).map { message ->
-            (if (message.fromUser) "用户：" else "助手：") + message.text
-        }
+        val memoryResetAt = _assistantUiState.value.memoryResetAt
+        val conversationHistory = _assistantUiState.value.messages
+            .filter { it.createdAt >= memoryResetAt }
+            .takeLast(6)
+            .map { message ->
+                (if (message.fromUser) "用户：" else "助手：") + message.text
+            }
         updateAssistantState { state ->
             state.copy(
                 messages = state.messages + AssistantConversationMessage(fromUser = true, text = request),
@@ -137,19 +148,36 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             )
         }
         viewModelScope.launch {
+            var planningDay = currentPlanningDay()
+            var timelineBlocks: List<ScheduleBlockEntity> = emptyList()
+            var timelineLoadByDay: Map<Int, Int> = emptyMap()
             val result = runCatching {
+                planningDay = currentPlanningDay()
+                timelineBlocks = scheduleBlocksForHorizon(planningDay, 7)
                 val actualProfiles = container.models.observeAll().first()
                 val actualTasks = container.tasks.observeAll().first()
+                val actualLabels = container.labels.observeAll().first().map { it.name }
+                val timeline = timelineContext(
+                    timelineBlocks,
+                    actualTasks,
+                    planningDay,
+                    _assistantPreset.value
+                )
+                timelineLoadByDay = timelineBlocks
+                    .groupingBy { planningDayOffset(it.startAt, planningDay) }
+                    .fold(0) { total, block -> total + ((block.endAt - block.startAt).coerceAtLeast(0L) / 60_000L).toInt() }
                 val prompt = if (planningRequest) {
                     AssistantPlanParser.prompt(
                         request,
                         _assistantPreset.value,
                         actualTasks.filterNot { it.completed }.map { it.title },
-                        currentPlanningDay(),
+                        planningDay,
                         conversationHistory,
-                        _assistantUiState.value.draftBatches.takeLast(3).flatMap { batch -> batch.tasks.map { "${it.title}：${it.detail}" } }
+                        _assistantUiState.value.draftBatches.takeLast(3).flatMap { batch -> batch.tasks.map { "${it.title}：${it.detail}" } },
+                        timeline,
+                        existingLabels = actualLabels
                     )
-                } else AssistantPlanParser.chatPrompt(request, conversationHistory)
+                } else AssistantPlanParser.chatPrompt(request, conversationHistory, timeline)
                 val reply = router.complete(
                     prompt = prompt,
                     profiles = actualProfiles,
@@ -176,8 +204,20 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                         onFailure = { Triple(AssistantPlanParser.fallback(request), reply.copy(text = "模型返回格式无法解析：${it.message}"), true) }
                     )
                 }
+                val normalizedResolved = if (planningRequest) {
+                    resolved.first.copy(tasks = resolved.first.tasks.map { suggestion ->
+                        suggestion.copy(label = reuseExistingLabel(suggestion.label, actualLabels))
+                    })
+                } else resolved.first
+                val resolvedWithLabels = resolved.copy(first = normalizedResolved)
                 val forceSingleDay = listOf("今天完成", "今天做完", "今天全部", "今天内", "一天内").any(request::contains)
-                resolved.copy(first = AssistantPlanParser.distributeAcrossDays(resolved.first, _assistantPreset.value, forceSingleDay))
+                val distributed = AssistantPlanParser.distributeAcrossDays(
+                    resolvedWithLabels.first,
+                    effectiveAssistantPreset(resolvedWithLabels.first),
+                    forceSingleDay,
+                    timelineLoadByDay
+                )
+                resolvedWithLabels.copy(first = keepSchedulableDrafts(alignAssistantPlan(distributed, planningDay, timelineBlocks)))
             }
             result.onSuccess { (plan, reply, fallback) ->
                 val sourceModel = if (reply.usedFallback && !reply.localFallback) "${reply.model}（自动切换）" else reply.model
@@ -188,7 +228,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                             summary = plan.summary,
                             modelName = sourceModel,
                             tasks = plan.tasks,
-                            baseDate = currentPlanningDay().toString(),
+                            baseDate = planningDay.toString(),
                             requestedWindowStart = plan.requestedWindowStart,
                             requestedWindowEnd = plan.requestedWindowEnd
                         )
@@ -204,7 +244,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             }.onFailure { error ->
                 val rawFallback = AssistantPlanParser.fallback(request)
                 val forceSingleDay = listOf("今天完成", "今天做完", "今天全部", "今天内", "一天内").any(request::contains)
-                val fallback = AssistantPlanParser.distributeAcrossDays(rawFallback, _assistantPreset.value, forceSingleDay)
+                val distributedFallback = AssistantPlanParser.distributeAcrossDays(
+                    rawFallback,
+                    effectiveAssistantPreset(rawFallback),
+                    forceSingleDay,
+                    occupiedMinutesByDay = timelineLoadByDay
+                )
+                val fallback = keepSchedulableDrafts(alignAssistantPlan(distributedFallback, planningDay, timelineBlocks))
                 updateAssistantState { state ->
                     val batch = if (fallback.isPlanning && fallback.tasks.isNotEmpty()) {
                         AssistantDraftBatch(
@@ -212,7 +258,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                             summary = fallback.summary,
                             modelName = "本地规则",
                             tasks = fallback.tasks,
-                            baseDate = currentPlanningDay().toString(),
+                            baseDate = planningDay.toString(),
                             requestedWindowStart = fallback.requestedWindowStart,
                             requestedWindowEnd = fallback.requestedWindowEnd
                         )
@@ -272,15 +318,19 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         val selected = batch?.tasks.orEmpty().filter { it.selected }
         if (selected.isEmpty()) { onResult("请先选择至少一个任务草案"); return@launch }
         runCatching {
+            val existingLabels = container.labels.observeAll().first().map { it.name }.toSet()
+            val selectedLabels = selected.map { normalizeTaskLabel(it.label) }.filter { it != "未分类" }.distinct()
+            val newLabels = selectedLabels.filterNot { label -> existingLabels.any { it.equals(label, ignoreCase = true) } }
+            val reusedLabels = selectedLabels.filter { label -> existingLabels.any { it.equals(label, ignoreCase = true) } }
             val created = container.database.withTransaction {
                 val baseDate = runCatching { LocalDate.parse(batch?.baseDate) }.getOrDefault(currentPlanningDay())
                 selected.map { suggestion ->
                     val label = normalizeTaskLabel(suggestion.label)
-                    if (label != "未分类") container.labels.insert(TaskLabelEntity(label))
+                    if (label != "未分类" && newLabels.any { it.equals(label, ignoreCase = true) }) container.labels.insert(TaskLabelEntity(label))
                     container.tasks.insert(
                         TaskEntity(
                             title = suggestion.title,
-                            detail = suggestion.detail,
+                            detail = assistantTaskDetail(suggestion),
                             subject = label,
                             priority = suggestion.priority.rank,
                             estimatedMinutes = roundTaskMinutes(suggestion.minutes),
@@ -289,15 +339,20 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                     )
                 }
             }
+            val resultMessage = buildString {
+                append("已创建 ${created.size} 项任务")
+                if (reusedLabels.isNotEmpty()) append("；复用已有标签：${reusedLabels.joinToString("、")}")
+                if (newLabels.isNotEmpty()) append("；新建标签：${newLabels.joinToString("、")}，请确认")
+            }
             updateAssistantState { state ->
                 state.copy(
                     draftBatches = state.draftBatches.mapNotNull { currentBatch ->
                         if (currentBatch.id != batchId) currentBatch else currentBatch.copy(tasks = currentBatch.tasks.filterNot { draft -> draft.id in selected.map { it.id }.toSet() }).takeIf { it.tasks.isNotEmpty() }
                     },
-                    messages = state.messages + AssistantConversationMessage(fromUser = false, text = "哼，${created.size} 项任务已经建好了。接下来可别只看着它们发呆。")
+                    messages = state.messages + AssistantConversationMessage(fromUser = false, text = "哼，$resultMessage。接下来可别只看着它们发呆。")
                 )
             }
-            "已创建 ${created.size} 项任务"
+            resultMessage
         }.onSuccess(onResult).onFailure { onResult("操作失败，未继续修改时间轴：${it.message ?: "未知错误"}") }
     }
 
@@ -319,12 +374,21 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                 priority = suggestion.priority,
                 minutes = roundTaskMinutes(suggestion.minutes),
                 preferredDay = suggestion.dayOffset?.let { baseDate.plusDays(it.toLong()) },
-                createdAt = batch.createdAt
+                createdAt = batch.createdAt,
+                assistantOrder = suggestion.assistantOrder ?: selected.indexOf(suggestion),
+                schedulingHint = suggestion.schedulingHint,
+                parentTaskTitle = suggestion.parentTaskTitle,
+                preferredStartMinute = suggestion.recommendedStartMinute
             )
         }
-        val preset = if (batch.requestedWindowStart != null && batch.requestedWindowEnd != null) {
-            _assistantPreset.value.copy(windowStartMinute = batch.requestedWindowStart, windowEndMinute = batch.requestedWindowEnd)
-        } else _assistantPreset.value
+        val preset = effectiveAssistantPreset(
+            AssistantPlan(
+                summary = "",
+                tasks = emptyList(),
+                requestedWindowStart = batch.requestedWindowStart,
+                requestedWindowEnd = batch.requestedWindowEnd
+            )
+        )
         generateSchedulePreview(
             kind = SchedulePreviewKind.DRAFTS,
             title = "草案智能排程",
@@ -339,14 +403,14 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     fun scheduleExistingTasks(taskIds: Set<Long>, onResult: (String) -> Unit) = viewModelScope.launch {
         if (taskIds.isEmpty()) { onResult("请先选择已有任务"); return@launch }
         val scheduledIds = container.schedule.getScheduledTaskIds().toSet()
-        val selected = taskIds.mapNotNull { container.tasks.getById(it) }
+        val selected = container.tasks.observeAll().first().filter { it.id in taskIds }
             .filter { !it.completed && !it.hidden && it.id !in scheduledIds }
             .distinctBy(::familyRootId)
         if (selected.isEmpty()) { onResult("所选任务已排程或不可用"); return@launch }
         generateSchedulePreview(
             kind = SchedulePreviewKind.EXISTING,
             title = "本地任务智能排程",
-            schedulingTasks = selected.map(::taskToSchedulingTask),
+            schedulingTasks = selected.mapIndexed { index, task -> taskToSchedulingTask(task, index) },
             preset = _assistantPreset.value,
             selectedTaskIds = selected.mapTo(mutableSetOf()) { it.id },
             onResult = onResult
@@ -369,7 +433,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         updateAssistantState {
             it.copy(
                 scheduling = true,
-                scheduleStatus = "正在整理任务、空闲时段与排除时段…",
+                scheduleStatus = "正在读取任务、时间轴空档与排程预设…",
                 error = null,
                 schedulePreview = null
             )
@@ -388,13 +452,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             val primaryModel = profiles.filter { it.enabled }.minByOrNull { it.id }
             updateAssistantState {
                 it.copy(
-                    scheduleStatus = primaryModel?.let { profile -> "正在请 ${profile.name} 优化排程，最长等待45秒…" }
-                        ?: "未启用模型，正在使用本地规则排程…"
+                    scheduleStatus = primaryModel?.let { profile -> "正在请 ${profile.name} 给出任务顺序，最长等待45秒…" }
+                        ?: "未启用模型，正在使用本地规则排序…"
                 )
             }
             val reply = router.complete(
-                AgentSchedulePlanner.prompt(request),
-                profiles,
+                prompt = AgentSchedulePlanner.prompt(request),
+                profiles = profiles,
                 jsonMode = true,
                 systemPrompt = GPT_GIRL_SYSTEM_PROMPT,
                 options = ModelRequestOptions(
@@ -407,14 +471,17 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             )
             updateAssistantState {
                 it.copy(
-                    scheduleStatus = if (reply.localFallback) "模型未及时返回，正在生成本地稳健排程…" else "模型已返回，正在校验冲突与任务时长…"
+                    scheduleStatus = if (reply.localFallback) "模型未及时返回，正在使用本地顺序和空档规则…" else "模型顺序已返回，正在校验真实空档与任务时长…"
                 )
             }
-            val proposal = if (reply.localFallback) AgentSchedulePlanner.localPlan(request).copy(validationNote = reply.text)
-            else AgentSchedulePlanner.resolve(reply.text, request)
+            val proposal = if (reply.localFallback) {
+                AgentSchedulePlanner.localPlan(request).copy(validationNote = reply.text)
+            } else {
+                AgentSchedulePlanner.resolve(reply.text, request)
+            }
             val modelName = when {
                 reply.localFallback -> "本地规则"
-                proposal.usedLocalFallback -> "本地规则（模型结果已校验回退）"
+                proposal.usedLocalFallback -> "本地规则（模型结果无法解析，已回退）"
                 reply.usedFallback -> "${reply.model}（自动切换）"
                 else -> reply.model
             }
@@ -434,7 +501,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             updateAssistantState { it.copy(scheduling = false, scheduleStatus = null, schedulePreview = preview, modelName = preview.modelName) }
             onResult("排程预览已生成，请检查后确认")
         }.onFailure { error ->
-            val local = AgentSchedulePlanner.localPlan(request).copy(validationNote = error.message ?: "模型调用失败")
+            val local = AgentSchedulePlanner.localPlan(request).copy(validationNote = error.message ?: "本地排程失败")
             val preview = SchedulePreviewState(
                 kind = kind,
                 title = title,
@@ -447,8 +514,8 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                 excludedTaskIds = excludedTaskIds,
                 taskEdit = taskEdit
             )
-            updateAssistantState { it.copy(scheduling = false, scheduleStatus = null, schedulePreview = preview, error = "模型排程失败，已生成本地预览：${error.message ?: "未知错误"}") }
-            onResult("模型不可用，已生成本地排程预览")
+            updateAssistantState { it.copy(scheduling = false, scheduleStatus = null, schedulePreview = preview, error = "本地排程出现异常，已生成可校验预览：${error.message ?: "未知错误"}") }
+            onResult("本地排程出现异常，已生成预览")
         }
     }
 
@@ -484,8 +551,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             }
             onResult(result)
         }.onFailure { error ->
-            updateAssistantState { it.copy(scheduling = false, scheduleStatus = null, error = "应用失败，时间轴未修改：${error.message ?: "未知错误"}") }
-            onResult("应用失败，时间轴未被部分修改：${error.message ?: "未知错误"}")
+            val message = error.message ?: "未知错误"
+            val userMessage = if (error is NoSchedulableDraftsException) message else "应用失败，时间轴未修改：$message"
+            updateAssistantState { it.copy(scheduling = false, scheduleStatus = null, error = userMessage) }
+            onResult(userMessage)
         }
     }
 
@@ -503,19 +572,34 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                 priority = suggestion.priority,
                 minutes = roundTaskMinutes(suggestion.minutes),
                 preferredDay = suggestion.dayOffset?.let { baseDate.plusDays(it.toLong()) },
-                createdAt = batch.createdAt
+                createdAt = batch.createdAt,
+                assistantOrder = suggestion.assistantOrder ?: selected.indexOf(suggestion),
+                schedulingHint = suggestion.schedulingHint,
+                parentTaskTitle = suggestion.parentTaskTitle,
+                preferredStartMinute = suggestion.recommendedStartMinute
             )
         }
         if (currentSchedulingTasks != preview.request.tasks) throw IllegalStateException("草案在预览后发生变化，请重新排程")
+        val schedulable = selected.filter { suggestion ->
+            val key = draftTaskKey(batch.id, suggestion.id)
+            preview.proposal.blocks.any { it.taskKey == key }
+        }
+        if (schedulable.isEmpty()) {
+            throw NoSchedulableDraftsException("当前预览没有可写入的完整空档；草案仍保留，请调整排程预设、任务时长或已有时间轴后重试。")
+        }
+        val existingLabels = container.labels.observeAll().first().map { it.name }.toSet()
+        val selectedLabels = schedulable.map { normalizeTaskLabel(it.label) }.filter { it != "未分类" }.distinct()
+        val newLabels = selectedLabels.filterNot { label -> existingLabels.any { it.equals(label, ignoreCase = true) } }
+        val reusedLabels = selectedLabels.filter { label -> existingLabels.any { it.equals(label, ignoreCase = true) } }
         var scheduledBlocks = 0
         container.database.withTransaction {
-            selected.forEach { suggestion ->
+            schedulable.forEach { suggestion ->
                 val label = normalizeTaskLabel(suggestion.label)
-                if (label != "未分类") container.labels.insert(TaskLabelEntity(label))
+                if (label != "未分类" && newLabels.any { it.equals(label, ignoreCase = true) }) container.labels.insert(TaskLabelEntity(label))
                 val key = draftTaskKey(batch.id, suggestion.id)
                 val root = TaskEntity(
                     title = suggestion.title,
-                    detail = suggestion.detail,
+                    detail = assistantTaskDetail(suggestion),
                     subject = label,
                     priority = suggestion.priority.rank,
                     estimatedMinutes = roundTaskMinutes(suggestion.minutes),
@@ -527,10 +611,15 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         updateAssistantState { state ->
             state.copy(draftBatches = state.draftBatches.mapNotNull { current ->
                 if (current.id != batch.id) current
-                else current.copy(tasks = current.tasks.filterNot { it.id in preview.selectedSuggestionIds }).takeIf { it.tasks.isNotEmpty() }
+                else current.copy(tasks = current.tasks.filterNot { draft -> schedulable.any { it.id == draft.id } }).takeIf { it.tasks.isNotEmpty() }
             })
         }
-        return "已创建 ${selected.size} 项任务并写入 $scheduledBlocks 个时间块；未排入项保留在任务列表。"
+        val pendingCount = selected.size - schedulable.size
+        return buildString {
+            append("已创建 ${schedulable.size} 项任务并写入 $scheduledBlocks 个时间块；${pendingCount} 项因当前没有完整空档，仍保留在草案中")
+            if (reusedLabels.isNotEmpty()) append("；复用已有标签：${reusedLabels.joinToString("、")}")
+            if (newLabels.isNotEmpty()) append("；新建标签：${newLabels.joinToString("、")}，请确认")
+        }
     }
 
     private suspend fun applyExistingPreview(preview: SchedulePreviewState): String {
@@ -538,7 +627,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             val source = container.tasks.getById(edit.sourceTaskId)
                 ?: container.tasks.getById(edit.rootTaskId)
                 ?: throw IllegalStateException("任务已经不存在")
-            val expected = taskToSchedulingTask(source).copy(
+            val expected = taskToSchedulingTask(source, 0).copy(
                 title = edit.title,
                 detail = edit.detail,
                 label = edit.label,
@@ -559,7 +648,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         }
         val current = preview.selectedTaskIds.mapNotNull { container.tasks.getById(it) }
             .distinctBy(::familyRootId)
-        if (current.size != preview.selectedTaskIds.size || current.map(::taskToSchedulingTask) != preview.request.tasks) {
+        val currentByKey = current.associateBy(::existingTaskKey)
+        val currentScheduling = preview.request.tasks.mapIndexedNotNull { index, requested ->
+            currentByKey[requested.key]?.let { task -> taskToSchedulingTask(task, requested.assistantOrder ?: index) }
+        }
+        if (current.size != preview.selectedTaskIds.size || currentScheduling != preview.request.tasks) {
             throw IllegalStateException("任务在预览后发生变化，请重新排程")
         }
         var scheduledBlocks = 0
@@ -728,7 +821,63 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         return container.schedule.getBetween(start, end)
     }
 
-    private fun taskToSchedulingTask(task: TaskEntity) = SchedulingTask(
+    private fun timelineContext(
+        blocks: List<ScheduleBlockEntity>,
+        tasks: List<TaskEntity>,
+        startDay: LocalDate,
+        preset: AssistantPreset
+    ): List<String> {
+        val taskById = tasks.associateBy { it.id }
+        val zone = ZoneId.systemDefault()
+        val occupied = blocks.sortedBy { it.startAt }.map { block ->
+            val start = Instant.ofEpochMilli(block.startAt).atZone(zone)
+            val planningDate = if (start.toLocalTime().isBefore(LocalTime.of(2, 0))) {
+                start.toLocalDate().minusDays(1)
+            } else start.toLocalDate()
+            val dayOffset = ChronoUnit.DAYS.between(startDay, planningDate).toInt()
+            val startMinute = start.hour * 60 + start.minute + if (start.toLocalTime().isBefore(LocalTime.of(2, 0))) 24 * 60 else 0
+            val duration = ((block.endAt - block.startAt).coerceAtLeast(0L) / 60_000L).toInt()
+            val task = block.taskId?.let(taskById::get)
+            val status = when {
+                task == null -> "固定时段"
+                task.completed -> "已完成"
+                else -> "未完成"
+            }
+            "第${dayOffset + 1}天 ${AssistantPlanParser.formatMinute(startMinute)}-${AssistantPlanParser.formatMinute(startMinute + duration)} ${block.title}（$status）"
+        }
+        // Use the exact same 06:00-to-next-day-02:00 grid as the scheduler so
+        // chat replies cannot infer that an empty interval is unavailable.
+        val availability = AgentSchedulePlanner.availableRuns(
+            SchedulingRequest(
+                tasks = emptyList(),
+                existingBlocks = blocks,
+                preset = preset,
+                startDay = startDay,
+                dayCount = 7,
+                earliestMinuteToday = currentPlanningMinute().coerceAtLeast(preset.windowStartMinute)
+            ),
+            minimumMinutes = 10
+        )
+        val availableByDay = (0 until 7).map { dayOffset ->
+                val runs = availability.filter { it.dayOffset == dayOffset }
+                val description = runs.joinToString("、") { run ->
+                    "${AssistantPlanParser.formatMinute(run.startMinute)}-${AssistantPlanParser.formatMinute(run.startMinute + run.minutes)}（${run.minutes}分钟）"
+                }.ifBlank { "无连续空档" }
+                "第${dayOffset + 1}天可用连续空档：$description"
+            }
+        return occupied + availableByDay
+    }
+
+    private fun planningDayOffset(startAt: Long, startDay: LocalDate): Int {
+        val zone = ZoneId.systemDefault()
+        val start = Instant.ofEpochMilli(startAt).atZone(zone)
+        val planningDate = if (start.toLocalTime().isBefore(LocalTime.of(2, 0))) {
+            start.toLocalDate().minusDays(1)
+        } else start.toLocalDate()
+        return ChronoUnit.DAYS.between(startDay, planningDate).toInt()
+    }
+
+    private fun taskToSchedulingTask(task: TaskEntity, assistantOrder: Int? = null) = SchedulingTask(
         key = existingTaskKey(task),
         title = task.title,
         detail = task.detail,
@@ -736,8 +885,118 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         priority = Priority.fromRank(task.priority),
         minutes = roundTaskMinutes(task.estimatedMinutes),
         preferredDay = task.plannedDayEpoch?.let(LocalDate::ofEpochDay),
-        createdAt = task.createdAt
+        createdAt = task.createdAt,
+        assistantOrder = task.detail.detailAssistantOrder() ?: assistantOrder,
+        schedulingHint = task.detail.detailSchedulingHint(),
+        parentTaskTitle = task.detail.detailParentTask(),
+        preferredStartMinute = task.detail.detailSchedulingHint()?.let(::parseRecommendedMinute)
     )
+
+    private fun reuseExistingLabel(candidate: String, existingLabels: List<String>): String {
+        val normalized = normalizeTaskLabel(candidate)
+        return existingLabels.firstOrNull { it.equals(normalized, ignoreCase = true) } ?: normalized
+    }
+
+    private fun assistantTaskDetail(suggestion: AssistantTaskSuggestion): String = buildString {
+        append(suggestion.detail.trim())
+        suggestion.schedulingHint?.takeIf { it.isNotBlank() }?.let { hint ->
+            if (isNotEmpty()) append("\n")
+            append("排程建议：").append(hint.removePrefix("排程建议："))
+        }
+        suggestion.parentTaskTitle?.takeIf { it.isNotBlank() }?.let { parent ->
+            if (isNotEmpty()) append("\n")
+            append("所属整体任务：").append(parent)
+        }
+        suggestion.assistantOrder?.let { order ->
+            if (isNotEmpty()) append("\n")
+            append("助手顺序：").append(order + 1)
+        }
+    }
+
+    private fun String.detailSchedulingHint(): String? = lineSequence()
+        .firstOrNull { it.startsWith("排程建议：") }
+        ?.removePrefix("排程建议：")
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+    private fun String.detailParentTask(): String? = lineSequence()
+        .firstOrNull { it.startsWith("所属整体任务：") }
+        ?.removePrefix("所属整体任务：")
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+    private fun String.detailAssistantOrder(): Int? = Regex("助手顺序：(\\d+)")
+        .find(this)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toIntOrNull()
+        ?.minus(1)
+
+    private fun parseRecommendedMinute(hint: String): Int? = Regex("(?:次日)?(\\d{1,2}):(\\d{2})")
+        .find(hint)
+        ?.let { match ->
+            val hour = match.groupValues[1].toIntOrNull() ?: return@let null
+            val minute = match.groupValues[2].toIntOrNull() ?: return@let null
+            if (hour !in 0..23 || minute !in 0..59) null else normalizePlanningMinute(hour * 60 + minute)
+        }
+
+    private fun effectiveAssistantPreset(plan: AssistantPlan): AssistantPreset {
+        val base = _assistantPreset.value
+        val rawStart = plan.requestedWindowStart ?: return base
+        val rawEnd = plan.requestedWindowEnd ?: return base
+        val start = normalizePlanningMinute(rawStart)
+        val end = normalizePlanningMinute(rawEnd)
+        if (start !in PLANNING_DAY_START_MINUTE until PLANNING_DAY_END_MINUTE || end <= start) return base
+        return base.copy(
+            windowStartMinute = start,
+            windowEndMinute = end.coerceIn(start + 10, PLANNING_DAY_END_MINUTE)
+        )
+    }
+
+    private fun alignAssistantPlan(
+        plan: AssistantPlan,
+        planningDay: LocalDate,
+        timelineBlocks: List<ScheduleBlockEntity>
+    ): AssistantPlan {
+        if (!plan.isPlanning || plan.tasks.isEmpty()) return plan
+        val preset = effectiveAssistantPreset(plan)
+        val request = SchedulingRequest(
+            tasks = plan.tasks.mapIndexed { index, suggestion ->
+                SchedulingTask(
+                    key = suggestion.id,
+                    title = suggestion.title,
+                    detail = suggestion.detail,
+                    label = normalizeTaskLabel(suggestion.label),
+                    priority = suggestion.priority,
+                    minutes = roundTaskMinutes(suggestion.minutes),
+                    preferredDay = suggestion.dayOffset?.let { planningDay.plusDays(it.toLong()) },
+                    // Keep tie-breaking identical to the assistant's insertion order.
+                    createdAt = index.toLong(),
+                    assistantOrder = suggestion.assistantOrder ?: index,
+                    schedulingHint = suggestion.schedulingHint,
+                    parentTaskTitle = suggestion.parentTaskTitle,
+                    preferredStartMinute = suggestion.recommendedStartMinute
+                )
+            },
+            existingBlocks = timelineBlocks,
+            preset = preset,
+            startDay = planningDay,
+            dayCount = 7,
+            earliestMinuteToday = currentPlanningMinute().coerceAtLeast(preset.windowStartMinute)
+        )
+        return plan.alignToSchedule(request)
+    }
+
+    /** Generation should only expose drafts that the current seven-day grid can place. */
+    private fun keepSchedulableDrafts(plan: AssistantPlan): AssistantPlan {
+        if (!plan.isPlanning || plan.tasks.isEmpty()) return plan
+        val dropped = plan.tasks.count { it.scheduleNote != null }
+        if (dropped == 0) return plan
+        return plan.copy(
+            tasks = plan.tasks.filter { it.scheduleNote == null },
+            summary = "${plan.summary} ${dropped} 项因未来7天没有可用空档未生成草案，请先调整预设或时间轴。"
+        )
+    }
 
     private fun familyRootId(task: TaskEntity) = task.parentTaskId ?: task.id
     private fun existingTaskKey(task: TaskEntity) = "task:${familyRootId(task)}"
@@ -822,7 +1081,13 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     private fun updateAssistantState(transform: (AssistantUiState) -> AssistantUiState) {
         _assistantUiState.update(transform)
         val state = _assistantUiState.value
-        container.assistantPreferences.saveWorkspace(AssistantWorkspace(state.messages, state.draftBatches))
+        container.assistantPreferences.saveWorkspace(
+            AssistantWorkspace(
+                messages = state.messages,
+                draftBatches = state.draftBatches,
+                memoryResetAt = state.memoryResetAt
+            )
+        )
     }
 
     private fun currentPlanningDay(): LocalDate = if (LocalTime.now().isBefore(LocalTime.of(2, 0))) LocalDate.now().minusDays(1) else LocalDate.now()
@@ -947,7 +1212,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                     onResult("已保留完成记录，任务没有剩余时长")
                     return@launch
                 }
-                val schedulingTask = taskToSchedulingTask(existing).copy(
+                val schedulingTask = taskToSchedulingTask(existing, 0).copy(
                     title = edit.title,
                     detail = edit.detail,
                     label = edit.label,
@@ -1091,5 +1356,27 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
     fun askAssistant(prompt: String, onReply: (String) -> Unit) = viewModelScope.launch {
         onReply(router.complete(prompt, models.value).text)
+    }
+
+    fun clearAssistantMemory(onResult: (String) -> Unit = {}) {
+        val cleared = _assistantUiState.value.messages.size
+        updateAssistantState {
+            it.copy(
+                memoryResetAt = System.currentTimeMillis(),
+                loading = false,
+                scheduling = false,
+                scheduleStatus = null,
+                schedulePreview = null,
+                error = null,
+                modelName = null
+            )
+        }
+        onResult(
+            if (cleared == 0) {
+                "当前没有对话记忆可清除；任务草案、本地任务、时间预设均保留，七天自动清理规则不变。"
+            } else {
+                "已清除 $cleared 条对话记忆（用户消息和助手回复）；任务草案、本地任务、时间预设均保留，七天自动清理规则不变。"
+            }
+        )
     }
 }

@@ -24,6 +24,14 @@ class FocusTimerService : Service() {
     private var strictRequested = false
     private var pausedRemainingMillis = 0L
     private var paused = false
+    private val melodyLock = Any()
+    private var melodyThread: Thread? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        strictRequested = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(KEY_STRICT_REQUESTED, false)
+    }
 
     private val updateNotification = object : Runnable {
         override fun run() {
@@ -49,6 +57,10 @@ class FocusTimerService : Service() {
         }
         if (intent?.action == ACTION_RESUME) {
             resumeTimer()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_SET_STRICT) {
+            setStrictEnabled(intent.getBooleanExtra(EXTRA_STRICT_ENABLED, false))
             return START_NOT_STICKY
         }
 
@@ -83,7 +95,20 @@ class FocusTimerService : Service() {
             .putInt(KEY_SEGMENT_DURATION_SECONDS, segmentDurations[segmentIndex])
             .putBoolean(KEY_IS_BREAK, isBreak)
             .putString(KEY_TASK_TITLE, taskTitle)
+            .putBoolean(KEY_STRICT_REQUESTED, strictRequested)
             .putBoolean(KEY_STRICT_ACTIVE, strictRequested && !isBreak)
+            .apply()
+    }
+
+    private fun setStrictEnabled(enabled: Boolean) {
+        strictRequested = enabled
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val running = prefs.getBoolean(KEY_RUNNING, false)
+        val isPaused = prefs.getBoolean(KEY_PAUSED, false)
+        val isBreak = prefs.getBoolean(KEY_IS_BREAK, false)
+        prefs.edit()
+            .putBoolean(KEY_STRICT_REQUESTED, enabled)
+            .putBoolean(KEY_STRICT_ACTIVE, enabled && running && !isPaused && !isBreak)
             .apply()
     }
 
@@ -130,8 +155,11 @@ class FocusTimerService : Service() {
         } else {
             showEventNotification("番茄计划完成", "$taskTitle · 所有专注段已完成")
             clearSession()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // Keep the foreground service alive until the completion melody has finished.
+            handler.postDelayed({
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }, MELODY_DURATION_MILLIS + 250L)
         }
     }
 
@@ -150,6 +178,10 @@ class FocusTimerService : Service() {
     }
 
     private fun timerNotification(seconds: Int): Notification {
+        val pauseIntent = PendingIntent.getService(
+            this, 5, Intent(this, FocusTimerService::class.java).setAction(ACTION_PAUSE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val stopIntent = PendingIntent.getService(
             this, 2, Intent(this, FocusTimerService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
@@ -165,7 +197,8 @@ class FocusTimerService : Service() {
             .setContentText("%02d:%02d · %s".format(seconds / 60, seconds % 60, currentPhaseText()))
             .setOnlyAlertOnce(true)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_media_pause, "结束", stopIntent)
+            .addAction(android.R.drawable.ic_media_pause, "暂停", pauseIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "结束", stopIntent)
             .build()
     }
 
@@ -196,34 +229,37 @@ class FocusTimerService : Service() {
     }
 
     private fun playTransitionMelody() {
-        Thread {
-            val sampleRate = 44_100
-            val noteSeconds = 0.18
-            val gapSeconds = 0.04
-            val frequencies = doubleArrayOf(523.25, 659.25, 783.99)
-            val noteSamples = (sampleRate * noteSeconds).toInt()
-            val gapSamples = (sampleRate * gapSeconds).toInt()
-            val samples = ShortArray((noteSamples + gapSamples) * frequencies.size)
-            frequencies.forEachIndexed { noteIndex, frequency ->
-                val offset = noteIndex * (noteSamples + gapSamples)
-                for (index in 0 until noteSamples) {
-                    val edge = minOf(index / 700.0, (noteSamples - index) / 700.0, 1.0)
-                    samples[offset + index] = (sin(2.0 * PI * frequency * index / sampleRate) * Short.MAX_VALUE * 0.22 * edge).toInt().toShort()
+        synchronized(melodyLock) {
+            if (melodyThread?.isAlive == true) return
+            melodyThread = Thread {
+                val sampleRate = 44_100
+                val durationMillis = MELODY_DURATION_MILLIS
+                val samples = ShortArray((sampleRate * durationMillis / 1_000L).toInt())
+                val notes = doubleArrayOf(523.25, 659.25, 783.99, 659.25, 587.33, 698.46, 880.0, 698.46)
+                val noteMillis = 560L
+                samples.indices.forEach { index ->
+                    val elapsed = index * 1_000L / sampleRate
+                    val noteIndex = ((elapsed / noteMillis) % notes.size).toInt()
+                    val withinNote = elapsed % noteMillis
+                    val frequency = notes[noteIndex]
+                    val edge = minOf(withinNote / 80.0, (noteMillis - withinNote) / 100.0, 1.0)
+                    samples[index] = (sin(2.0 * PI * frequency * index / sampleRate) * Short.MAX_VALUE * 0.18 * edge).toInt().toShort()
                 }
-            }
-            runCatching {
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                    .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-                    .setBufferSizeInBytes(samples.size * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-                track.write(samples, 0, samples.size)
-                track.play()
-                Thread.sleep(((samples.size * 1_000L) / sampleRate) + 80L)
-                track.release()
-            }
-        }.start()
+                runCatching {
+                    val track = AudioTrack.Builder()
+                        .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                        .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                        .setBufferSizeInBytes(samples.size * 2)
+                        .setTransferMode(AudioTrack.MODE_STATIC)
+                        .build()
+                    track.write(samples, 0, samples.size)
+                    track.play()
+                    Thread.sleep(durationMillis + 120L)
+                    track.release()
+                }
+                synchronized(melodyLock) { melodyThread = null }
+            }.also { it.start() }
+        }
     }
 
     private fun clearSession() {
@@ -249,6 +285,7 @@ class FocusTimerService : Service() {
         const val EXTRA_SEGMENT_BREAKS = "segment_breaks"
         const val EXTRA_TASK_TITLE = "task_title"
         const val EXTRA_STRICT = "strict"
+        const val EXTRA_STRICT_ENABLED = "strict_enabled"
         const val PREFS = "focus_timer_state"
         const val KEY_END_AT = "end_at"
         const val KEY_RUNNING = "running"
@@ -260,12 +297,15 @@ class FocusTimerService : Service() {
         const val KEY_IS_BREAK = "is_break"
         const val KEY_TASK_TITLE = "task_title"
         const val KEY_STRICT_ACTIVE = "strict_active"
+        const val KEY_STRICT_REQUESTED = "strict_requested"
         const val ACTION_STOP = "com.ming.focusplan.STOP_TIMER"
         const val ACTION_PAUSE = "com.ming.focusplan.PAUSE_TIMER"
         const val ACTION_RESUME = "com.ming.focusplan.RESUME_TIMER"
+        const val ACTION_SET_STRICT = "com.ming.focusplan.SET_STRICT"
         private const val TIMER_CHANNEL = "focus_timer"
         private const val EVENT_CHANNEL = "focus_events"
         private const val NOTIFICATION_ID = 1001
         private const val EVENT_NOTIFICATION_ID = 1002
+        private const val MELODY_DURATION_MILLIS = 5_000L
     }
 }

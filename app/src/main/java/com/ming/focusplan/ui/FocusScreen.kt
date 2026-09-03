@@ -173,6 +173,9 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 onResume = if (timerState.paused) {
                     { context.startService(Intent(context, FocusTimerService::class.java).setAction(FocusTimerService.ACTION_RESUME)) }
                 } else null,
+                onPause = if (timerState.running && !timerState.paused) {
+                    { context.startService(Intent(context, FocusTimerService::class.java).setAction(FocusTimerService.ACTION_PAUSE)) }
+                } else null,
                 onStop = { context.startService(Intent(context, FocusTimerService::class.java).setAction(FocusTimerService.ACTION_STOP)) }
             )
         } else {
@@ -255,6 +258,13 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 Switch(checked = strictEnabled, onCheckedChange = {
                     strictEnabled = it
                     FocusPreferences.setStrictEnabled(context, it)
+                    if (timerState.running || timerState.paused) {
+                        context.startService(
+                            Intent(context, FocusTimerService::class.java)
+                                .setAction(FocusTimerService.ACTION_SET_STRICT)
+                                .putExtra(FocusTimerService.EXTRA_STRICT_ENABLED, it)
+                        )
+                    }
                 })
             }
         )
@@ -309,7 +319,12 @@ fun FocusScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ActiveTimerPanel(state: TimerUiState, onResume: (() -> Unit)?, onStop: () -> Unit) {
+private fun ActiveTimerPanel(
+    state: TimerUiState,
+    onResume: (() -> Unit)?,
+    onPause: (() -> Unit)?,
+    onStop: () -> Unit
+) {
     val progress = if (state.segmentSeconds <= 0) 0f else 1f - state.secondsLeft.toFloat() / state.segmentSeconds
     Surface(color = if (state.isBreak) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(6.dp)) {
         Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -322,6 +337,9 @@ private fun ActiveTimerPanel(state: TimerUiState, onResume: (() -> Unit)?, onSto
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 onResume?.let {
                     Button(onClick = it) { Icon(Icons.Default.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text("继续") }
+                }
+                onPause?.let {
+                    Button(onClick = it) { Text("||"); Spacer(Modifier.width(6.dp)); Text("暂停") }
                 }
                 TextButton(onClick = onStop, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
                     Icon(Icons.Default.Close, null)

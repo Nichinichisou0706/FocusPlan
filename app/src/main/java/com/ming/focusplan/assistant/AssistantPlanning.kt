@@ -49,7 +49,14 @@ data class AssistantTaskSuggestion(
     val priority: Priority = Priority.MEDIUM,
     val minutes: Int = 50,
     val dayOffset: Int? = null,
-    val selected: Boolean = true
+    val selected: Boolean = true,
+    /** Filled by the local feasibility check; null means the draft has a known slot. */
+    val scheduleNote: String? = null,
+    /** Guidance from the assistant, kept separate from the executable task detail. */
+    val schedulingHint: String? = null,
+    val parentTaskTitle: String? = null,
+    val assistantOrder: Int? = null,
+    val recommendedStartMinute: Int? = null
 )
 
 data class AssistantConversationMessage(
@@ -73,7 +80,9 @@ data class AssistantDraftBatch(
 
 data class AssistantWorkspace(
     val messages: List<AssistantConversationMessage> = emptyList(),
-    val draftBatches: List<AssistantDraftBatch> = emptyList()
+    val draftBatches: List<AssistantDraftBatch> = emptyList(),
+    /** Messages remain visible after clearing, but messages before this point are not sent to the model. */
+    val memoryResetAt: Long = 0L
 )
 
 data class AssistantPlan(
@@ -83,6 +92,55 @@ data class AssistantPlan(
     val requestedWindowEnd: Int? = null,
     val isPlanning: Boolean = true
 )
+
+/**
+ * Runs the same whole-task planner used by the schedule confirmation flow so a
+ * generated draft never claims a day that is already full or outside the
+ * current preset. Tasks that cannot fit remain drafts and carry an explicit
+ * reason for the user to review.
+ */
+fun AssistantPlan.alignToSchedule(request: SchedulingRequest): AssistantPlan {
+    if (!isPlanning || tasks.isEmpty()) return this
+    val proposal = AgentSchedulePlanner.localPlan(request)
+    val blocksByTask = proposal.blocks.groupBy { it.taskKey }
+    val unscheduledByTask = proposal.unscheduled.associateBy { it.taskKey }
+    val alignedTasks = tasks.mapIndexed { taskIndex, task ->
+        blocksByTask[task.id]?.let { blocks ->
+            val ordered = blocks.sortedWith(compareBy<ProposedScheduleBlock> { it.dayOffset }.thenBy { it.startMinute })
+            val recommendation = ordered.joinToString("、") { block ->
+                "第${block.dayOffset + 1}天${AssistantPlanParser.formatMinute(block.startMinute)}-${AssistantPlanParser.formatMinute(block.startMinute + block.minutes)}"
+            }
+            val hint = buildList {
+                add("建议安排：$recommendation")
+                task.schedulingHint?.takeIf { it.isNotBlank() && !it.startsWith("建议安排：") }?.let { add(it) }
+            }.joinToString("；")
+            task.copy(
+                dayOffset = ordered.first().dayOffset,
+                scheduleNote = null,
+                schedulingHint = hint,
+                recommendedStartMinute = ordered.first().startMinute,
+                assistantOrder = task.assistantOrder ?: taskIndex
+            )
+        } ?: unscheduledByTask[task.id]?.let { unscheduled ->
+            task.copy(
+                dayOffset = null,
+                scheduleNote = "暂未安排：${unscheduled.reason}",
+                assistantOrder = task.assistantOrder ?: taskIndex
+            )
+        } ?: task.copy(
+            dayOffset = null,
+            scheduleNote = "暂未安排：排程器没有返回有效时间段",
+            assistantOrder = task.assistantOrder ?: taskIndex
+        )
+    }
+    val unscheduledCount = alignedTasks.count { it.scheduleNote != null }
+    val scheduleSummary = if (unscheduledCount == 0) {
+        "${summary} 已按现有时间轴、排程预设和连续空档完成可行性预检。"
+    } else {
+        "${summary} 已按现有时间轴和排程预设预检；${unscheduledCount} 项当前没有足够长的连续空档，不会进入本批可创建草案。"
+    }
+    return copy(summary = scheduleSummary, tasks = alignedTasks)
+}
 
 object AssistantPlanParser {
     fun parse(raw: String): AssistantPlan {
@@ -110,7 +168,10 @@ object AssistantPlanParser {
                             label = item.firstString("label", "subject", "category", "tag").ifBlank { "未分类" },
                             priority = parsePriority(item.firstString("priority", "level")),
                             minutes = item.taskMinutes(),
-                            dayOffset = item.optionalDayOffset("dayOffset", "day", "dayIndex")
+                            dayOffset = item.optionalDayOffset("dayOffset", "day", "dayIndex"),
+                            schedulingHint = item.firstString("schedulingHint", "scheduleHint", "recommendation", "recommendedTime").ifBlank { null },
+                            parentTaskTitle = item.firstString("parentTaskTitle", "parentTask", "overallTask", "group").ifBlank { null },
+                            assistantOrder = item.optionalInt("assistantOrder", "order", "sequence")
                         )
                     )
                 }
@@ -157,41 +218,62 @@ object AssistantPlanParser {
         existingTasks: List<String>,
         date: LocalDate,
         conversation: List<String> = emptyList(),
-        currentDrafts: List<String> = emptyList()
+        currentDrafts: List<String> = emptyList(),
+        existingTimeline: List<String> = emptyList(),
+        existingLabels: List<String> = emptyList()
     ): String = """
         你正在执行考研任务拆解。用户已明确要求创建、安排或细化具体任务。
         今天日期：$date
         用户长期预设：${preset.instructions}
         今天允许安排：${formatMinute(preset.windowStartMinute)} 至 ${formatMinute(preset.windowEndMinute)}
-        排除时段：${preset.excludedTimes.filter { it.enabled }.joinToString { "${it.label} ${formatMinute(it.startMinute)}-${formatMinute(it.endMinute)}" }.ifBlank { "无" }}
+        排除时段：${preset.excludedTimes.filter { it.enabled }.joinToString { "${it.label} ${formatMinute(normalizePlanningMinute(it.startMinute))}-${formatMinute(normalizePlanningMinute(it.endMinute))}" }.ifBlank { "无" }}
+        已有标签（优先复用，只有确实没有合适标签时才新建）：${existingLabels.joinToString("、").ifBlank { "无" }}
         已有未完成任务：${existingTasks.take(20).joinToString { it.take(60) }.ifBlank { "无" }}
+        已有时间轴安排（只读，用于避开冲突和判断负荷）：${existingTimeline.take(30).joinToString(" | ") { it.take(120) }.ifBlank { "无" }}
         待确认草案：${currentDrafts.takeLast(12).joinToString { it.take(90) }.ifBlank { "无" }}
         最近对话：${conversation.joinToString(" | ").ifBlank { "无" }}
         本轮要求：$input
 
         只返回一个紧凑 JSON 对象，不要 Markdown或额外解释：
-        {"type":"plan","reply":"用GPT娘口吻说明总工作量、预计天数和分天理由","scheduleStart":"17:00或空","scheduleEnd":"20:00或空","tasks":[{"title":"具体任务名","detail":"步骤和完成标准","label":"标签","priority":"HIGH/MEDIUM/LOW","minutes":50,"dayOffset":0或null}]}
-        dayOffset=0表示$date，1表示次日，以此类推，最多30；没有明确执行日建议时可为null。任务拆解阶段必须直接生成可独立执行的时间块：每项30到120分钟，大任务按章节、题组或学习阶段拆成多个任务，之后的排程阶段不会再次拆分。先估算整个目标真正需要的总时间，每日学习任务原则上不超过360分钟，不得为了塞进一天而低估时长。只有用户明确要求当天全部完成时才集中到一天。最多16项。若用户说“再加”“追加”或“另外”，只生成本轮新增任务，不复制待确认草案和已有任务。若用户要求细化上一批，参考待确认草案重新拆细。仅在本轮明确指定安排时段时填写开始和结束；minutes使用10分钟整数倍。排除吃饭、睡觉、游戏，不确定的信息写入detail提醒核对。reply可以明显傲娇，任务名称、detail和完成标准必须保持客观清楚，不要加入语气词。
+        {"type":"plan","reply":"用GPT娘口吻说明总工作量、预计天数和分天理由","scheduleStart":"17:00或空","scheduleEnd":"20:00或空","tasks":[{"title":"具体任务名","detail":"步骤和完成标准","label":"已有标签或新标签","priority":"HIGH/MEDIUM/LOW","minutes":50,"dayOffset":0或null,"schedulingHint":"推荐时段与理由","parentTaskTitle":"所属整体任务或空","assistantOrder":1}]}
+        dayOffset=0表示$date，1表示次日，以此类推，最多7天（与一键排程的未来7天窗口一致）；没有明确执行日建议时可为null。任务拆解阶段不要把90到120分钟以内的大任务机械切成30/40分钟，优先保留一个完整任务；超过120分钟才按章节、题组或学习阶段拆成多个可独立执行任务。排程阶段会先尝试把任务整块放入真实空档，只有没有完整空档时才按空挡分成30到90分钟块。先估算整个目标真正需要的总时间，每日学习任务原则上不超过360分钟，不得为了塞进一天而低估时长。只有用户明确要求当天全部完成时才集中到一天。最多16项。已有时间轴和排除时段是硬约束，不要把已占用区间算作可用时间；无法在未来7天完整容纳的任务仍生成草案但不要假装安排在今天。每项任务的schedulingHint写建议安排时段或空挡理由，parentTaskTitle写它属于的整体任务；assistantOrder按本轮推荐顺序从1开始。若用户说“再加”“追加”或“另外”，只生成本轮新增任务，不复制待确认草案和已有任务。若用户要求细化上一批，参考待确认草案重新细化。仅在本轮明确指定安排时段时填写开始和结束；minutes使用10分钟整数倍。排除吃饭、睡觉、游戏，不确定的信息写入detail提醒核对。reply可以明显傲娇，任务名称、detail和完成标准必须保持客观清楚，不要加入语气词。
     """.trimIndent()
 
-    fun distributeAcrossDays(plan: AssistantPlan, preset: AssistantPreset, forceSingleDay: Boolean = false): AssistantPlan {
+    fun distributeAcrossDays(
+        plan: AssistantPlan,
+        preset: AssistantPreset,
+        forceSingleDay: Boolean = false,
+        occupiedMinutesByDay: Map<Int, Int> = emptyMap()
+    ): AssistantPlan {
         if (!plan.isPlanning || plan.tasks.isEmpty()) return plan
         val availableMinutes = usableMinutesPerDay(preset).coerceAtMost(DEFAULT_DAILY_STUDY_LIMIT)
         if (availableMinutes < 10) return plan
-        val maxBlockMinutes = minOf(MAX_EXECUTION_BLOCK_MINUTES, availableMinutes)
+        // Keep ordinary 90-120 minute tasks intact. The schedule planner, which
+        // sees the real gaps, decides whether a task actually needs fragments.
+        val maxBlockMinutes = MAX_EXECUTION_BLOCK_MINUTES
         val expanded = plan.tasks.flatMap { splitIntoExecutionBlocks(it, maxBlockMinutes) }
         if (forceSingleDay || plan.tasks.any { (it.dayOffset ?: 0) > 0 }) return plan.copy(tasks = expanded)
-        val totalWithBreaks = expanded.sumOf { it.minutes } + (expanded.size - 1).coerceAtLeast(0) * 10
-        if (totalWithBreaks <= availableMinutes) return plan.copy(tasks = expanded)
+        // A duration-only load summary cannot describe fragmented free gaps. Leave
+        // the day open when real timeline blocks exist; alignToSchedule will use
+        // the exact grid and assign each task to the first feasible day.
+        if (occupiedMinutesByDay.isNotEmpty()) return plan.copy(tasks = expanded)
+        val totalMinutes = expanded.sumOf { it.minutes }
+        val todayCapacity = (availableMinutes - occupiedMinutesByDay.getOrDefault(0, 0)).coerceAtLeast(0)
+        if (totalMinutes <= todayCapacity) return plan.copy(tasks = expanded)
         var day = 0
-        var used = 0
+        var used = occupiedMinutesByDay.getOrDefault(0, 0).coerceAtLeast(0)
         val distributed = expanded.map { task ->
-            val required = task.minutes + if (used == 0) 0 else 10
-            if (used > 0 && used + required > availableMinutes) {
+            while (true) {
+                val occupied = occupiedMinutesByDay.getOrDefault(day, 0).coerceAtLeast(0)
+                val capacity = (availableMinutes - occupied).coerceAtLeast(0)
+                val studyUsed = (used - occupied).coerceAtLeast(0)
+                if (studyUsed + task.minutes <= capacity || day >= 30) {
+                    used += task.minutes
+                    break
+                }
                 day += 1
-                used = 0
+                used = occupiedMinutesByDay.getOrDefault(day, 0).coerceAtLeast(0)
             }
-            used += task.minutes + if (used == 0) 0 else 10
             task.copy(dayOffset = day.coerceAtMost(30))
         }
         val days = distributed.maxOf { it.dayOffset ?: 0 } + 1
@@ -201,9 +283,10 @@ object AssistantPlanParser {
         )
     }
 
-    fun chatPrompt(input: String, conversation: List<String>): String = """
+    fun chatPrompt(input: String, conversation: List<String>, existingTimeline: List<String> = emptyList()): String = """
         现在只进行正常对话，不创建任务、不输出JSON。保持明显的二次元傲娇感，但先回答问题，不要用角色口吻掩盖信息。
         最近对话：${conversation.takeLast(6).joinToString(" | ").ifBlank { "无" }}
+        当前时间轴安排（只读）：${existingTimeline.take(20).joinToString(" | ") { it.take(120) }.ifBlank { "无" }}
         用户：$input
     """.trimIndent()
 
@@ -265,6 +348,11 @@ object AssistantPlanParser {
         return raw.toString().toIntOrNull()?.coerceIn(0, 30)
     }
 
+    private fun JSONObject.optionalInt(vararg keys: String): Int? {
+        val raw = keys.firstNotNullOfOrNull { key -> opt(key).takeUnless { it == null || it == JSONObject.NULL } } ?: return null
+        return raw.toString().toIntOrNull()
+    }
+
     private fun splitIntoExecutionBlocks(task: AssistantTaskSuggestion, maxMinutes: Int): List<AssistantTaskSuggestion> {
         val totalMinutes = roundTaskMinutes(task.minutes)
         if (totalMinutes <= maxMinutes) return listOf(task.copy(minutes = totalMinutes))
@@ -277,7 +365,9 @@ object AssistantPlanParser {
                 id = UUID.randomUUID().toString(),
                 title = "${task.title}（第${index + 1}/$partCount 块）",
                 detail = task.detail.ifBlank { "完成本块内容并记录进度，下一块从记录处继续。" },
-                minutes = (baseSlots + if (index < extraSlots) 1 else 0) * 10
+                minutes = (baseSlots + if (index < extraSlots) 1 else 0) * 10,
+                parentTaskTitle = task.parentTaskTitle ?: task.title,
+                assistantOrder = task.assistantOrder?.let { it * partCount + index }
             )
         }
     }
@@ -291,8 +381,8 @@ object AssistantPlanParser {
         val windowEnd = preset.windowEndMinute
         val excluded = preset.excludedTimes.filter { it.enabled }
             .mapNotNull { period ->
-                val start = maxOf(windowStart, period.startMinute)
-                val end = minOf(windowEnd, period.endMinute)
+                val start = maxOf(windowStart, normalizePlanningMinute(period.startMinute))
+                val end = minOf(windowEnd, normalizePlanningMinute(period.endMinute))
                 (start to end).takeIf { end > start }
             }
             .sortedBy { it.first }

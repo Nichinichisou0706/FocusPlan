@@ -1,6 +1,8 @@
 package com.ming.focusplan.focus
 
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.provider.Settings
 
 object FocusPreferences {
@@ -28,10 +30,24 @@ object FocusPreferences {
     fun isAllowed(context: Context, packageName: String): Boolean {
         val defaultInput = Settings.Secure.getString(context.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
             ?.substringBefore('/')
+        val homePackage = context.packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+            0
+        )?.activityInfo?.packageName
         return packageName == context.packageName ||
             packageName == defaultInput ||
+            packageName == homePackage ||
             packageName in whitelist(context) ||
             packageName in ALWAYS_ALLOWED
+    }
+
+    /** Accessibility also reports volume panels, launchers and dialog providers. Only block a real launchable user app. */
+    fun isMonitoredApplication(context: Context, packageName: String): Boolean {
+        if (packageName.isBlank() || isAllowed(context, packageName)) return false
+        val info = runCatching { context.packageManager.getApplicationInfo(packageName, 0) }.getOrNull()
+            ?: return false
+        if (info.flags and ApplicationInfo.FLAG_SYSTEM != 0) return false
+        return context.packageManager.getLaunchIntentForPackage(packageName) != null
     }
 
     private fun settings(context: Context) = context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)

@@ -1,8 +1,10 @@
 package com.ming.focusplan.assistant
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.time.ZoneId
 import java.time.LocalDate
 
 class AssistantPlanningTest {
@@ -73,7 +75,27 @@ class AssistantPlanningTest {
     }
 
     @Test
-    fun explicitMultiDayAssignmentFromModelIsPreserved() {
+    fun existingTimelineLoadMovesNewDraftsToNextDay() {
+        val plan = AssistantPlan(
+            summary = "安排学习",
+            tasks = listOf(
+                AssistantTaskSuggestion(title = "新任务一", minutes = 120),
+                AssistantTaskSuggestion(title = "新任务二", minutes = 120)
+            )
+        )
+
+        val distributed = AssistantPlanParser.distributeAcrossDays(
+            plan,
+            AssistantPreset(),
+            occupiedMinutesByDay = mapOf(0 to 300)
+        )
+
+        assertTrue(distributed.tasks.all { it.dayOffset == null })
+        assertTrue(distributed.summary == "安排学习")
+    }
+
+    @Test
+    fun explicitMultiDayAssignmentFromModelKeepsDaysWhileUsingSmallBlocks() {
         val plan = AssistantPlan(
             summary = "三天完成",
             tasks = listOf(
@@ -82,7 +104,11 @@ class AssistantPlanningTest {
             )
         )
 
-        assertEquals(plan, AssistantPlanParser.distributeAcrossDays(plan, AssistantPreset()))
+        val distributed = AssistantPlanParser.distributeAcrossDays(plan, AssistantPreset())
+        assertEquals(2, distributed.tasks.size)
+        assertEquals(setOf(0), distributed.tasks.take(1).map { it.dayOffset }.toSet())
+        assertEquals(setOf(2), distributed.tasks.drop(1).map { it.dayOffset }.toSet())
+        assertTrue(distributed.tasks.all { it.minutes == 50 })
     }
 
     @Test
@@ -101,6 +127,20 @@ class AssistantPlanningTest {
         assertTrue(!prompt.contains("娱乐 12:00-13:00"))
         assertTrue(prompt.contains("英语单词"))
         assertTrue(prompt.contains("下午效率更高"))
+    }
+
+    @Test
+    fun promptIncludesExistingTimelineContext() {
+        val prompt = AssistantPlanParser.prompt(
+            "安排今天的数学复习",
+            AssistantPreset(),
+            emptyList(),
+            LocalDate.of(2026, 8, 25),
+            existingTimeline = listOf("第1天 09:00-10:00 线性代数第六章（未完成）")
+        )
+
+        assertTrue(prompt.contains("已有时间轴安排"))
+        assertTrue(prompt.contains("线性代数第六章"))
     }
 
     @Test
@@ -125,7 +165,103 @@ class AssistantPlanningTest {
         val prepared = AssistantPlanParser.distributeAcrossDays(plan, AssistantPreset(), forceSingleDay = true)
 
         assertEquals(2, prepared.tasks.size)
-        assertEquals(listOf(120, 120), prepared.tasks.map { it.minutes })
+        assertEquals(List(2) { 120 }, prepared.tasks.map { it.minutes })
         assertTrue(prepared.tasks.all { it.title.contains("块") })
+    }
+
+    @Test
+    fun generatedDraftUsesTheFirstWholeGapAfterExistingTimeline() {
+        val zone = ZoneId.systemDefault()
+        val existing = com.ming.focusplan.data.ScheduleBlockEntity(
+            title = "已有任务",
+            startAt = LocalDate.of(2026, 8, 25).atTime(9, 0).atZone(zone).toInstant().toEpochMilli(),
+            endAt = LocalDate.of(2026, 8, 25).atTime(10, 20).atZone(zone).toInstant().toEpochMilli()
+        )
+        val plan = AssistantPlan("安排", listOf(AssistantTaskSuggestion(title = "新任务", minutes = 60)))
+        val request = SchedulingRequest(
+            tasks = plan.tasks.map { task ->
+                SchedulingTask(task.id, task.title, task.detail, task.label, task.priority, task.minutes)
+            },
+            existingBlocks = listOf(existing),
+            preset = AssistantPreset(windowStartMinute = 9 * 60, windowEndMinute = 12 * 60),
+            startDay = LocalDate.of(2026, 8, 25),
+            dayCount = 1,
+            earliestMinuteToday = 9 * 60
+        )
+
+        val aligned = plan.alignToSchedule(request)
+        assertEquals(0, aligned.tasks.single().dayOffset)
+        assertNull(aligned.tasks.single().scheduleNote)
+        val placed = AgentSchedulePlanner.localPlan(request).blocks
+        assertEquals(10 * 60 + 20, placed.minBy { it.startMinute }.startMinute)
+        assertEquals(60, placed.sumOf { it.minutes })
+    }
+
+    @Test
+    fun generatedDraftDoesNotUseTimeOutsideRequestedWindow() {
+        val plan = AssistantPlan("安排", listOf(AssistantTaskSuggestion(title = "新任务", minutes = 60)))
+        val request = SchedulingRequest(
+            tasks = plan.tasks.map { task ->
+                SchedulingTask(task.id, task.title, task.detail, task.label, task.priority, task.minutes)
+            },
+            existingBlocks = emptyList(),
+            preset = AssistantPreset(windowStartMinute = 13 * 60, windowEndMinute = 14 * 60),
+            startDay = LocalDate.of(2026, 8, 25),
+            dayCount = 1,
+            earliestMinuteToday = 6 * 60
+        )
+
+        val aligned = plan.alignToSchedule(request)
+        assertNull(aligned.tasks.single().scheduleNote)
+        val placed = AgentSchedulePlanner.localPlan(request).blocks
+        assertEquals(13 * 60, placed.minBy { it.startMinute }.startMinute)
+        assertEquals(60, placed.sumOf { it.minutes })
+    }
+
+    @Test
+    fun generatedDraftUsesSmallestSufficientFragmentedGap() {
+        val zone = ZoneId.systemDefault()
+        val date = LocalDate.of(2026, 8, 25)
+        fun block(startHour: Int, endHour: Int) = com.ming.focusplan.data.ScheduleBlockEntity(
+            title = "已有安排",
+            startAt = date.atTime(startHour, 0).atZone(zone).toInstant().toEpochMilli(),
+            endAt = date.atTime(endHour, 0).atZone(zone).toInstant().toEpochMilli()
+        )
+        val plan = AssistantPlan("安排", listOf(AssistantTaskSuggestion(title = "新任务", minutes = 60)))
+        val request = SchedulingRequest(
+            tasks = plan.tasks.map { task ->
+                SchedulingTask(task.id, task.title, task.detail, task.label, task.priority, task.minutes)
+            },
+            existingBlocks = listOf(block(9, 10), block(11, 12)),
+            preset = AssistantPreset(windowStartMinute = 9 * 60, windowEndMinute = 14 * 60),
+            startDay = date,
+            dayCount = 1,
+            earliestMinuteToday = 9 * 60
+        )
+
+        val placed = AgentSchedulePlanner.localPlan(request).blocks
+        assertEquals(10 * 60, placed.minBy { it.startMinute }.startMinute)
+        assertEquals(60, placed.sumOf { it.minutes })
+        assertNull(plan.alignToSchedule(request).tasks.single().scheduleNote)
+    }
+
+    @Test
+    fun generatedDraftExplainsWhenNoWholeGapExists() {
+        val plan = AssistantPlan("安排", listOf(AssistantTaskSuggestion(title = "大任务", minutes = 120)))
+        val request = SchedulingRequest(
+            tasks = plan.tasks.map { task ->
+                SchedulingTask(task.id, task.title, task.detail, task.label, task.priority, task.minutes)
+            },
+            existingBlocks = emptyList(),
+            preset = AssistantPreset(windowStartMinute = 9 * 60, windowEndMinute = 10 * 60 + 50),
+            startDay = LocalDate.of(2026, 8, 25),
+            dayCount = 1,
+            earliestMinuteToday = 9 * 60
+        )
+
+        val task = plan.alignToSchedule(request).tasks.single()
+        assertEquals(null, task.dayOffset)
+        assertTrue(task.scheduleNote?.contains("暂未安排") == true)
+        assertTrue(task.scheduleNote?.contains("任何可用连续空档") == true)
     }
 }

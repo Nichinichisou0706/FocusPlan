@@ -23,7 +23,7 @@ class FocusAccessibilityService : AccessibilityService() {
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
         if (!FocusPreferences.isStrictSessionActive(this)) return
         val packageName = event.packageName?.toString().orEmpty()
-        if (packageName.isBlank() || FocusPreferences.isAllowed(this, packageName)) return
+        if (!FocusPreferences.isMonitoredApplication(this, packageName)) return
 
         val now = System.currentTimeMillis()
         if (packageName == lastBlockedPackage && now - lastBlockedAt < 1_200L) return

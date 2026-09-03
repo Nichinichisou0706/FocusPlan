@@ -140,7 +140,15 @@ class AssistantPreferences(context: Context) {
                                 priority = runCatching { Priority.valueOf(task.optString("priority")) }.getOrDefault(Priority.MEDIUM),
                                 minutes = task.optInt("minutes", 50).coerceIn(10, 480),
                                 dayOffset = if (task.has("dayOffset") && !task.isNull("dayOffset")) task.optInt("dayOffset", 0).coerceIn(0, 30) else null,
-                                selected = task.optBoolean("selected", true)
+                                selected = task.optBoolean("selected", true),
+                                scheduleNote = task.optString("scheduleNote").trim()
+                                    .takeUnless { it.isBlank() || it.equals("null", ignoreCase = true) },
+                                schedulingHint = task.optString("schedulingHint").trim()
+                                    .takeUnless { it.isBlank() || it.equals("null", ignoreCase = true) },
+                                parentTaskTitle = task.optString("parentTaskTitle").trim()
+                                    .takeUnless { it.isBlank() || it.equals("null", ignoreCase = true) },
+                                assistantOrder = task.optionalInt("assistantOrder"),
+                                recommendedStartMinute = task.optionalInt("recommendedStartMinute")
                             )
                         )
                     }
@@ -165,7 +173,11 @@ class AssistantPreferences(context: Context) {
                 }
             }
         }
-        AssistantWorkspace(messages, batches.takeLast(MAX_DRAFT_BATCHES)).also { workspace ->
+        AssistantWorkspace(
+            messages = messages,
+            draftBatches = batches.takeLast(MAX_DRAFT_BATCHES),
+            memoryResetAt = root.optLong("memoryResetAt", 0L).coerceAtLeast(0L)
+        ).also { workspace ->
             if (workspace.messages.size != messagesJson.length() || workspace.draftBatches.size != batchesJson.length()) saveWorkspace(workspace)
         }
     }.getOrDefault(AssistantWorkspace())
@@ -195,6 +207,11 @@ class AssistantPreferences(context: Context) {
                                 .put("priority", task.priority.name)
                                 .put("minutes", task.minutes)
                                 .put("dayOffset", task.dayOffset ?: JSONObject.NULL)
+                                .put("scheduleNote", task.scheduleNote ?: JSONObject.NULL)
+                                .put("schedulingHint", task.schedulingHint ?: JSONObject.NULL)
+                                .put("parentTaskTitle", task.parentTaskTitle ?: JSONObject.NULL)
+                                .put("assistantOrder", task.assistantOrder ?: JSONObject.NULL)
+                                .put("recommendedStartMinute", task.recommendedStartMinute ?: JSONObject.NULL)
                                 .put("selected", task.selected)
                         )
                     }
@@ -213,7 +230,14 @@ class AssistantPreferences(context: Context) {
                 )
             }
         }
-        preferences.edit().putString(KEY_WORKSPACE, JSONObject().put("messages", messages).put("draftBatches", batches).toString()).apply()
+        preferences.edit().putString(
+            KEY_WORKSPACE,
+            JSONObject()
+                .put("messages", messages)
+                .put("draftBatches", batches)
+                .put("memoryResetAt", workspace.memoryResetAt)
+                .toString()
+        ).apply()
     }
 
     private fun JSONObject.optionalInt(key: String): Int? = if (has(key) && !isNull(key)) optInt(key) else null

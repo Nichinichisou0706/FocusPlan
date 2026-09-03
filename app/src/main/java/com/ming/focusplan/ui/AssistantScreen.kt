@@ -4,9 +4,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -41,6 +43,7 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
     var input by rememberSaveable { mutableStateOf("") }
     var page by rememberSaveable { mutableIntStateOf(0) }
     var showPreset by remember { mutableStateOf(false) }
+    var showClearMemory by remember { mutableStateOf(false) }
     var selectedExisting by rememberSaveable { mutableStateOf(emptyList<Long>()) }
     var editingDraft by remember { mutableStateOf<Pair<String, AssistantTaskSuggestion>?>(null) }
     var editingTask by remember { mutableStateOf<TaskEntity?>(null) }
@@ -77,6 +80,9 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     contentDescription = null,
                     size = 62.dp
                 )
+                IconButton(onClick = { showClearMemory = true }) {
+                    Icon(Icons.Default.Delete, "清除对话记忆")
+                }
                 IconButton(onClick = { showPreset = true }) { Icon(Icons.Default.Settings, "排程预设") }
             }
 
@@ -139,6 +145,24 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         vm.saveAssistantPreset(it)
         showPreset = false
     }
+    if (showClearMemory) {
+        AlertDialog(
+            onDismissRequest = { showClearMemory = false },
+            title = { Text("清除助手记忆？") },
+            text = {
+                Text(
+                    "将清除当前 ${state.messages.size} 条对话记录（用户消息和助手回复），并立即移除模型可读取的对话上下文。任务草案、本地任务、时间轴和预设不会删除；对话仍会在七天后自动清理。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.clearAssistantMemory { message -> scope.launch { snackbar.showSnackbar(message) } }
+                    showClearMemory = false
+                }) { Text("清除记忆") }
+            },
+            dismissButton = { TextButton(onClick = { showClearMemory = false }) { Text("取消") } }
+        )
+    }
     editingDraft?.let { (batchId, draft) ->
         val batch = state.draftBatches.firstOrNull { it.id == batchId }
         val baseDate = runCatching { LocalDate.parse(batch?.baseDate) }.getOrDefault(LocalDate.now())
@@ -164,7 +188,9 @@ fun AssistantScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                         label = value.label,
                         priority = value.priority,
                         minutes = value.minutes,
-                        dayOffset = dayOffset
+                        dayOffset = dayOffset,
+                        // Editing invalidates the previous feasibility check.
+                        scheduleNote = null
                     )
                 )
                 editingDraft = null
@@ -265,7 +291,16 @@ private fun AssistantChatPage(
                         }
                     }
                 }
-                items(state.messages, key = { it.id }) { message -> ChatBubble(message) }
+                val memoryBoundary = if (state.memoryResetAt > 0L) {
+                    state.messages.indexOfFirst { it.createdAt >= state.memoryResetAt }.let { if (it < 0) state.messages.size else it }
+                } else -1
+                itemsIndexed(state.messages, key = { _, message -> message.id }) { index, message ->
+                    if (index == memoryBoundary) MemoryBoundary()
+                    ChatBubble(message)
+                }
+                if (memoryBoundary == state.messages.size && memoryBoundary >= 0) {
+                    item(key = "memory-boundary-${state.memoryResetAt}") { MemoryBoundary() }
+                }
                 if (state.loading) {
                     item(key = "assistant-loading") {
                         Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -444,6 +479,15 @@ private fun DraftTaskRow(suggestion: AssistantTaskSuggestion, baseDate: String, 
             Text(suggestion.title, fontWeight = FontWeight.SemiBold)
             if (suggestion.detail.isNotBlank()) Text(suggestion.detail, maxLines = 3, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("${planDayLabel(baseDate, suggestion.dayOffset)} · ${suggestion.label} · ${suggestion.priority.label}优先 · ${suggestion.minutes}分钟", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            suggestion.parentTaskTitle?.takeIf { it.isNotBlank() }?.let {
+                Text("所属整体任务：$it", maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            suggestion.schedulingHint?.takeIf { it.isNotBlank() }?.let {
+                Text(it, maxLines = 3, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+            }
+            suggestion.scheduleNote?.let {
+                Text(it, maxLines = 3, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+            }
         }
         IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, "编辑并细化", Modifier.size(19.dp)) }
         IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "删除草案", Modifier.size(19.dp), tint = MaterialTheme.colorScheme.error) }
@@ -562,7 +606,7 @@ internal fun ScheduleProgressDialog(status: String) {
                     Text(status, style = MaterialTheme.typography.bodyLarge)
                 }
                 Text(
-                    "模型最迟等待45秒；若响应超时、截断或格式有误，会自动生成可检查的本地排程预览。",
+                    "模型只负责给出顺序和建议日；实际时间由本地空档校验，超时或格式有误会自动回退。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -679,7 +723,28 @@ private fun ChatBubble(message: AssistantConversationMessage) {
             color = if (message.fromUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(6.dp),
             modifier = Modifier.widthIn(max = 340.dp)
-        ) { Text(message.text, Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) }
+        ) {
+            SelectionContainer {
+                Text(message.text, Modifier.padding(horizontal = 12.dp, vertical = 9.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun MemoryBoundary() {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.outlineVariant)
+        Text(
+            "以上记忆已清除",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
